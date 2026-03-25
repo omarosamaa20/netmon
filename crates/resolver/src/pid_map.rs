@@ -60,6 +60,8 @@ pub(crate) fn build_inode_pid_map() -> HashMap<u64, InodePidEntry> {
                 Err(_) => continue,
             };
 
+            // G-03: per-entry symlink reads are short-lived; no fd handle is retained across iterations.
+
             if let Some(socket_inode) = parse_socket_inode(&symlink_target) {
                 inode_to_pid.insert(
                     socket_inode,

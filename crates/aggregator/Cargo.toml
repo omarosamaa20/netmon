@@ -6,5 +6,4 @@ edition = "2021"
 [dependencies]
 capture = { path = "../capture" }
 resolver = { path = "../resolver" }
-controller = { path = "../controller" }
 log = { workspace = true }

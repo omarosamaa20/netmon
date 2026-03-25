@@ -55,6 +55,7 @@ fn read_proc_file(
     is_ipv4: bool,
     sockets_by_inode: &mut HashMap<u64, SocketEntry>,
 ) -> Result<(), FallbackError> {
+    // G-03: this read opens one /proc file per call and drops the handle immediately after read.
     let content = fs::read_to_string(file_path).map_err(|source| FallbackError::FileOpen {
         path: file_path.to_string(),
         source,

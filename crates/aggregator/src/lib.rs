@@ -34,6 +34,9 @@ const RESOLVER_SCAN_INTERVAL: Duration = Duration::from_millis(800);
 /// Sleep duration at the end of each loop iteration to cap CPU usage.
 const LOOP_SLEEP_INTERVAL: Duration = Duration::from_millis(10);
 
+/// G-03: evict inactive process rows after this idle period to bound memory.
+const PROCESS_EVICTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Placeholder process label when resolver cannot map a flow.
 const UNKNOWN_PROCESS_LABEL: &str = "[unknown]";
 
@@ -42,6 +45,8 @@ pub struct ProcessRow {
     pub info: ProcessInfo,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
+    // G-03: snapshot includes last activity timestamp for bounded retention.
+    pub last_seen: Instant,
     pub tx_history: [u64; HISTORY_SLOTS],
     pub rx_history: [u64; HISTORY_SLOTS],
     pub is_blocked: bool,
@@ -56,6 +61,7 @@ pub struct ConnectionEntry {
     pub state: String,
     pub pid: u32,
     pub process: String,
+    pub username: String,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
 }
@@ -125,6 +131,8 @@ struct ProcessStats {
     info: ProcessInfo,
     tx_bytes_total: u64,
     rx_bytes_total: u64,
+    // G-03: used to evict inactive process entries after timeout.
+    last_seen: Instant,
     tx_current_second: u64,
     rx_current_second: u64,
     tx_history: [u64; HISTORY_SLOTS],
@@ -138,6 +146,7 @@ impl ProcessStats {
             info,
             tx_bytes_total: 0,
             rx_bytes_total: 0,
+            last_seen: Instant::now(),
             tx_current_second: 0,
             rx_current_second: 0,
             tx_history: [0; HISTORY_SLOTS],
@@ -226,6 +235,8 @@ fn run_aggregator_loop(
             &mut if_rx_current_second,
         );
         refresh_connection_cache_if_due(&mut resolver, &mut connection_cache, &mut last_proc_scan);
+        mark_exited_processes(&mut stats_by_pid, &mut resolver);
+        evict_stale_processes(&mut stats_by_pid);
         rotate_histories_if_due(
             &mut stats_by_pid,
             &mut if_tx_history,
@@ -247,6 +258,7 @@ fn run_aggregator_loop(
             if_tx_history,
             if_rx_history,
         );
+        // G-03: explicit small sleep prevents busy-waiting in the aggregator loop.
         thread::sleep(LOOP_SLEEP_INTERVAL);
     }
 }
@@ -261,6 +273,7 @@ fn drain_flow_channel(
     if_tx_current_second: &mut u64,
     if_rx_current_second: &mut u64,
 ) {
+    // G-03: bounded channel reads plus timeout provide back-pressure without unbounded queues.
     match rx.recv_timeout(CHANNEL_RECV_TIMEOUT) {
         Ok(first_record) => {
             process_record(
@@ -288,6 +301,24 @@ fn drain_flow_channel(
         Err(RecvTimeoutError::Timeout) => {}
         Err(RecvTimeoutError::Disconnected) => {}
     }
+}
+
+// G-10: mark rows as exited when PID no longer resolves but retention window has not elapsed.
+fn mark_exited_processes(stats_by_pid: &mut HashMap<u32, ProcessStats>, resolver: &mut Resolver) {
+    for (pid, stats) in stats_by_pid.iter_mut() {
+        if *pid == 0 {
+            continue;
+        }
+
+        if resolver.process_by_pid(*pid).is_none() && !stats.info.name.ends_with(" [exited]") {
+            stats.info.name = format!("{} [exited]", stats.info.name);
+        }
+    }
+}
+
+// G-03: remove stale process entries so the per-process map remains memory-bounded.
+fn evict_stale_processes(stats_by_pid: &mut HashMap<u32, ProcessStats>) {
+    stats_by_pid.retain(|_, stats| stats.last_seen.elapsed() <= PROCESS_EVICTION_TIMEOUT);
 }
 
 // Refreshes connection metadata from resolver cache at most once per interval.
@@ -360,6 +391,7 @@ fn process_record(
         .entry(info.pid)
         .or_insert_with(|| ProcessStats::new(info.clone()));
     entry.info = info;
+    entry.last_seen = Instant::now();
 
     match record.direction {
         Direction::Tx => {
@@ -424,6 +456,7 @@ fn publish_snapshots(
                 state: conn.state.clone(),
                 pid: conn.pid,
                 process: conn.process.clone(),
+                username: conn.username.clone(),
                 tx_bytes: 0,
                 rx_bytes: 0,
             });
@@ -435,6 +468,7 @@ fn publish_snapshots(
             info: stats.info.clone(),
             tx_bytes: stats.tx_bytes_total,
             rx_bytes: stats.rx_bytes_total,
+            last_seen: stats.last_seen,
             tx_history: stats.tx_history,
             rx_history: stats.rx_history,
             is_blocked: blocked.contains(pid),

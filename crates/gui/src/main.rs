@@ -52,6 +52,12 @@ const VERY_HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC: u64 = 10 * 1024 * 1024;
 /// Red tint used for blocked rows in the connection table.
 const BLOCKED_ROW_COLOR: Color32 = Color32::from_rgb(255, 140, 140);
 
+/// G-06: blocked processes must be visually distinct in the process table.
+const BLOCKED_PROCESS_ROW_FILL: Color32 = Color32::from_rgb(70, 20, 20);
+
+/// G-06: keep username text readable in a dedicated column.
+const USER_COLUMN_MIN_WIDTH: f32 = 110.0;
+
 /// Plot line color for TX bandwidth history.
 const TX_LINE_COLOR: Color32 = Color32::from_rgb(80, 120, 240);
 
@@ -60,9 +66,6 @@ const RX_LINE_COLOR: Color32 = Color32::from_rgb(60, 180, 90);
 
 /// Millisecond conversion helper for bits-per-second display.
 const BITS_PER_BYTE: f64 = 8.0;
-
-/// Decimal-thousand used in Kbps conversion.
-const KILO_BASE_DECIMAL: f64 = 1000.0;
 
 /// Binary scale used in byte/bit unit formatting.
 const KIBI_BASE: f64 = 1024.0;
@@ -112,6 +115,8 @@ struct NetmonApp {
     bpf_input: String,
     show_bits: bool,
     dns_enabled: bool,
+    // G-10: tracks the last successfully applied BPF expression.
+    active_filter: String,
     pending_block: Option<(u32, String)>,
     virtualization_warning: bool,
 }
@@ -168,6 +173,7 @@ impl NetmonApp {
             bpf_input: String::new(),
             show_bits: false,
             dns_enabled: false,
+            active_filter: String::new(),
             pending_block: None,
             virtualization_warning: detect_virtualbox(),
         }
@@ -243,9 +249,6 @@ impl NetmonApp {
     fn apply_bpf_filter(&mut self) {
         if let Some(control) = self.capture_control.as_ref() {
             let expr = self.bpf_input.trim().to_string();
-            if expr.is_empty() {
-                return;
-            }
             if let Err(e) = control.apply_filter(expr.clone()) {
                 if let Ok(mut status) = self.status_snapshot.write() {
                     *status = format!("BPF error: {e}");
@@ -304,8 +307,22 @@ impl NetmonApp {
     }
 
     // Drains pending status messages sent from background threads.
-    fn update_status_from_channel(&self) {
+    fn update_status_from_channel(&mut self) {
         while let Ok(msg) = self.status_rx.try_recv() {
+            // G-10: keep last successful filter when invalid expressions fail.
+            if let Some(applied_filter) = msg.strip_prefix("Filter applied: ") {
+                self.active_filter = applied_filter.to_string();
+            }
+
+            // G-10: transition UI state to stopped when capture thread reports failure.
+            if msg.starts_with("Capture stopped:") {
+                self.is_capturing = false;
+                self.capture_running.store(false, AtomicOrdering::Relaxed);
+                if let Some(mut control) = self.capture_control.take() {
+                    let _ = control.join_timeout(Duration::from_secs(THREAD_JOIN_TIMEOUT_SECS));
+                }
+            }
+
             if let Ok(mut status) = self.status_snapshot.write() {
                 *status = msg;
             }
@@ -320,7 +337,7 @@ impl NetmonApp {
                     blocked.insert(pid);
                 }
                 if let Ok(mut status) = self.status_snapshot.write() {
-                    *status = format!("Blocked process {name} (PID {pid})");
+                    *status = format!("Blocked {name} (PID {pid})");
                 }
             }
             Err(e) => {
@@ -512,14 +529,15 @@ impl NetmonApp {
 
     // Renders the start/stop capture button based on current capture state.
     fn render_capture_toggle_button(&mut self, ui: &mut egui::Ui) {
+        // G-07: explicit start/stop affordances for capture lifecycle control.
         if self.is_capturing {
-            if ui.button("Stop").clicked() {
+            if ui.button("■ Stop").clicked() {
                 self.stop_capture();
             }
             return;
         }
 
-        if ui.button("Start").clicked() {
+        if ui.button("▶ Start").clicked() {
             self.start_capture();
         }
     }
@@ -544,12 +562,16 @@ impl NetmonApp {
             ));
             ui.label(format!(
                 "Current BW: {}/s",
-                format_bytes_or_bits(interface_stats.current_bandwidth_bytes_per_sec, self.show_bits)
+                format_bandwidth(interface_stats.current_bandwidth_bytes_per_sec)
             ));
             ui.label(format!(
                 "Peak BW: {}/s",
-                format_bytes_or_bits(interface_stats.peak_bandwidth_bytes_per_sec, self.show_bits)
+                format_bandwidth(interface_stats.peak_bandwidth_bytes_per_sec)
             ));
+            if !self.active_filter.is_empty() {
+                // G-10: keep successful filter state visible after invalid attempts.
+                ui.label(format!("Active Filter: {}", self.active_filter));
+            }
         });
     }
 
@@ -574,6 +596,17 @@ impl NetmonApp {
     // Renders the connection table and row-level context menu actions.
     fn render_connection_table(&mut self, ui: &mut egui::Ui, sorted_rows: &[ProcessRow]) {
         let visible_connections = self.collect_visible_connections(sorted_rows);
+
+        if let Some(selected_pid) = self.selected_pid {
+            if let Some(selected_row) = sorted_rows.iter().find(|row| row.info.pid == selected_pid) {
+                // G-06: selected-row header makes process-to-user ownership explicit.
+                ui.label(format!(
+                    "Process: {} (PID {}) | User: {}",
+                    selected_row.info.name, selected_row.info.pid, selected_row.info.username
+                ));
+                ui.separator();
+            }
+        }
 
         ScrollArea::vertical().max_height(CONNECTION_TABLE_HEIGHT).show(ui, |ui| {
             egui::Grid::new("conn_grid").striped(true).show(ui, |ui| {
@@ -617,6 +650,8 @@ impl NetmonApp {
 
         let pid_response = ui.selectable_label(false, RichText::new(connection.pid.to_string()).color(row_color));
         ui.label(RichText::new(connection.process.clone()).color(row_color));
+        // G-02: show username directly on each connection row.
+        ui.label(RichText::new(connection.username.clone()).color(row_color));
         ui.label(RichText::new(connection.local_addr.to_string()).color(row_color));
         ui.label(RichText::new(connection.remote_addr.to_string()).color(row_color));
         ui.label(RichText::new(format_protocol(connection.protocol)).color(row_color));
@@ -668,6 +703,11 @@ impl App for NetmonApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         self.update_status_from_channel();
 
+        // G-07: keyboard shortcut for quickly clearing process selection.
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.selected_pid = None;
+        }
+
         self.render_top_panel(ctx);
         self.render_status_panel(ctx);
         self.render_main_panel(ctx);
@@ -680,6 +720,7 @@ impl App for NetmonApp {
 impl Drop for NetmonApp {
     // Stops worker threads and flushes netmon nft rules during application exit.
     fn drop(&mut self) {
+        // G-03: coordinated shutdown sets stop flags, joins workers, then flushes nft rules.
         self.capture_running.store(false, AtomicOrdering::Relaxed);
         self.app_running.store(false, AtomicOrdering::Relaxed);
 
@@ -760,29 +801,39 @@ fn draw_process_table(
                 ui.visuals().text_color()
             };
 
-            ui.horizontal(|ui| {
-                let selected = *selected_pid == Some(row.info.pid);
-                if ui
-                    .selectable_label(selected, RichText::new(row.info.pid.to_string()).color(hot_color))
-                    .clicked()
-                {
-                    if selected {
-                        *selected_pid = None;
-                    } else {
-                        *selected_pid = Some(row.info.pid);
+            let row_fill = if row.is_blocked {
+                BLOCKED_PROCESS_ROW_FILL
+            } else {
+                Color32::TRANSPARENT
+            };
+
+            egui::Frame::none().fill(row_fill).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let selected = *selected_pid == Some(row.info.pid);
+                    if ui
+                        .selectable_label(selected, RichText::new(row.info.pid.to_string()).color(hot_color))
+                        .clicked()
+                    {
+                        if selected {
+                            *selected_pid = None;
+                        } else {
+                            *selected_pid = Some(row.info.pid);
+                        }
                     }
-                }
-                ui.label(RichText::new(row.info.name.clone()).color(hot_color));
-                ui.label(RichText::new(format!("{} ({})", row.info.username, row.info.uid)).color(hot_color));
-                // Phase I Lesson WS-4: keep protocol split visible in the process table.
-                ui.label(RichText::new(protocol_mix_summary(row)).color(hot_color));
-                ui.label(RichText::new(format_bytes_or_bits(tx_rate, show_bits)).color(hot_color));
-                ui.label(RichText::new(format_bytes_or_bits(rx_rate, show_bits)).color(hot_color));
-                // Phase I Lesson IF-1: expose a smoother 10-second rate alongside 2-second rate.
-                ui.label(RichText::new(format_bytes_or_bits(tx_rate_10s, show_bits)).color(hot_color));
-                ui.label(RichText::new(format_bytes_or_bits(rx_rate_10s, show_bits)).color(hot_color));
-                ui.label(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color));
-                ui.label(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color));
+                    ui.label(RichText::new(row.info.name.clone()).color(hot_color));
+                    let user_text = RichText::new(row.info.username.clone()).color(hot_color);
+                    ui.add_sized([USER_COLUMN_MIN_WIDTH, 18.0], egui::Label::new(user_text));
+                    // Phase I Lesson WS-4: keep protocol split visible in the process table.
+                    ui.label(RichText::new(protocol_mix_summary(row)).color(hot_color));
+                    // G-05: display throughput in human-readable per-second units.
+                    ui.label(RichText::new(format_bandwidth(tx_rate)).color(hot_color));
+                    ui.label(RichText::new(format_bandwidth(rx_rate)).color(hot_color));
+                    // Phase I Lesson IF-1: expose a smoother 10-second rate alongside 2-second rate.
+                    ui.label(RichText::new(format_bandwidth(tx_rate_10s)).color(hot_color));
+                    ui.label(RichText::new(format_bandwidth(rx_rate_10s)).color(hot_color));
+                    ui.label(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color));
+                    ui.label(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color));
+                });
             });
             ui.separator();
         }
@@ -813,10 +864,10 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
     };
 
     let tx_points = (0..CHART_HISTORY_SECONDS)
-        .map(|i| [-(i as f64), bytes_to_kbps(tx_hist[i])])
+        .map(|i| [-(i as f64), bytes_to_kib_per_sec(tx_hist[i])])
         .collect::<PlotPoints>();
     let rx_points = (0..CHART_HISTORY_SECONDS)
-        .map(|i| [-(i as f64), bytes_to_kbps(rx_hist[i])])
+        .map(|i| [-(i as f64), bytes_to_kib_per_sec(rx_hist[i])])
         .collect::<PlotPoints>();
 
     let tx_line = Line::new(tx_points).name("TX").color(TX_LINE_COLOR);
@@ -824,8 +875,9 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
 
     Plot::new("traffic_plot")
         .height(CHART_HEIGHT)
-        .x_axis_label("Seconds")
-        .y_axis_label("Kbps")
+        // G-05: explicit axis labels for real-time demo clarity.
+        .x_axis_label("Last 40 seconds")
+        .y_axis_label("KB/s")
         .show(ui, |plot_ui| {
             plot_ui.line(tx_line);
             plot_ui.line(rx_line);
@@ -836,6 +888,8 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
 fn draw_connection_table_header(ui: &mut egui::Ui) {
     ui.label(RichText::new("PID").strong());
     ui.label(RichText::new("Process").strong());
+    // G-02/G-06: user ownership must be visible in active socket rows.
+    ui.label(RichText::new("User").strong());
     ui.label(RichText::new("Local").strong());
     ui.label(RichText::new("Remote").strong());
     ui.label(RichText::new("Proto").strong());
@@ -855,9 +909,20 @@ fn ten_second_avg(history: [u64; CHART_HISTORY_SECONDS]) -> u64 {
     history[0..10].iter().copied().sum::<u64>() / 10
 }
 
-// Converts bytes per second into kilobits per second for chart display.
-fn bytes_to_kbps(bytes_per_sec: u64) -> f64 {
-    (bytes_per_sec as f64) * BITS_PER_BYTE / KILO_BASE_DECIMAL
+// Converts bytes/s to KB/s for chart display.
+fn bytes_to_kib_per_sec(bytes_per_sec: u64) -> f64 {
+    (bytes_per_sec as f64) / KIBI_BASE
+}
+
+// G-05: helper for readable bandwidth rendering in tables and summary bars.
+fn format_bandwidth(bytes_per_sec: u64) -> String {
+    if bytes_per_sec < 1024 {
+        return format!("{} B/s", bytes_per_sec);
+    }
+    if bytes_per_sec < 1024 * 1024 {
+        return format!("{:.1} KB/s", (bytes_per_sec as f64) / KIBI_BASE);
+    }
+    format!("{:.1} MB/s", (bytes_per_sec as f64) / (KIBI_BASE * KIBI_BASE))
 }
 
 // Formats throughput as either byte or bit units based on UI toggle state.

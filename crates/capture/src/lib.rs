@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use log::warn;
+use log::{debug, error};
 use pcap::{Active, Capture};
 use thiserror::Error;
 
@@ -28,6 +28,7 @@ const PCAP_BUFFER_SIZE_BYTES: i32 = 2 * 1024 * 1024;
 
 /// libpcap read timeout in milliseconds.
 /// 100 ms prevents a busy loop while keeping UI updates responsive.
+/// G-03: pcap blocks for up to this timeout, avoiding busy-wait polling.
 const PCAP_READ_TIMEOUT_MS: i32 = 100;
 
 /// Ethernet II header length in bytes.
@@ -217,21 +218,22 @@ fn run_capture_loop(
         }
 
         match capture.next_packet() {
-            Ok(packet) => match parse_packet(packet.data, packet.header.len, local_ips) {
-                Ok(Some(record)) => {
+            Ok(packet) => {
+                if let Some(record) = parse_packet(packet.data, packet.header.len, local_ips) {
                     if flow_sender.send(record).is_err() {
                         return;
                     }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!("packet parse error: {e}");
-                }
-            },
+            }
             Err(pcap::Error::TimeoutExpired) => {}
             Err(e) => {
-                warn!("capture read error: {e}");
-                let _ = status_tx.send(format!("Capture warning: {e}"));
+                // G-10: fail closed on interface errors and notify GUI instead of spinning.
+                error!("capture read error: {e}");
+                running.store(false, Ordering::Relaxed);
+                let _ = status_tx.send(
+                    "Capture stopped: interface went down. Select an interface and click Start.".to_string(),
+                );
+                return;
             }
         }
     }
@@ -249,7 +251,7 @@ fn handle_pending_commands(
                 // Phase I Lesson WS-1: apply kernel-space BPF to reduce user-space load.
                 match capture.filter(&filter_expression, true) {
                     Ok(()) => {
-                        let _ = status_tx.send(format!("Applied BPF filter: {filter_expression}"));
+                        let _ = status_tx.send(format!("Filter applied: {filter_expression}"));
                     }
                     Err(error) => {
                         let _ = status_tx.send(format!("BPF error: {error}"));
@@ -268,9 +270,10 @@ fn parse_packet(
     packet_bytes: &[u8],
     packet_len: u32,
     local_ips: &[IpAddr],
-) -> Result<Option<FlowRecord>, String> {
+) -> Option<FlowRecord> {
     if packet_bytes.len() < ETHERNET_HEADER_LEN {
-        return Ok(None);
+        debug!("G-01: skipped short ethernet frame");
+        return None;
     }
 
     let ether_type = u16::from_be_bytes([packet_bytes[12], packet_bytes[13]]);
@@ -279,7 +282,8 @@ fn parse_packet(
 
     if current_ether_type == ETHERTYPE_VLAN_8021Q || current_ether_type == ETHERTYPE_VLAN_8021AD {
         if packet_bytes.len() < VLAN_ETHERNET_HEADER_LEN {
-            return Ok(None);
+            debug!("G-01: skipped short vlan-tagged ethernet frame");
+            return None;
         }
         current_ether_type = u16::from_be_bytes([packet_bytes[16], packet_bytes[17]]);
         l3_offset = VLAN_ETHERNET_HEADER_LEN;
@@ -288,12 +292,15 @@ fn parse_packet(
     let parsed = match current_ether_type {
         ETHERTYPE_IPV4 => parse_ipv4(packet_bytes, l3_offset)?,
         ETHERTYPE_IPV6 => parse_ipv6(packet_bytes, l3_offset)?,
-        _ => return Ok(None),
+        _ => {
+            debug!("G-01: skipped non-IP ethernet frame");
+            return None;
+        }
     };
 
     let direction = classify_direction(local_ips, parsed.src_ip, parsed.dst_ip);
 
-    Ok(Some(FlowRecord {
+    Some(FlowRecord {
         key: FlowKey {
             src_ip: parsed.src_ip,
             dst_ip: parsed.dst_ip,
@@ -304,7 +311,7 @@ fn parse_packet(
         byte_count: packet_len,
         timestamp: Instant::now(),
         direction,
-    }))
+    })
 }
 
 // Classifies traffic as TX or RX by comparing endpoints with local interface IPs.
@@ -328,19 +335,22 @@ struct ParsedL4 {
 }
 
 // Parses an IPv4 packet and extracts source/destination IP and L4 ports.
-fn parse_ipv4(packet_bytes: &[u8], layer3_offset: usize) -> Result<ParsedL4, String> {
+fn parse_ipv4(packet_bytes: &[u8], layer3_offset: usize) -> Option<ParsedL4> {
     if packet_bytes.len() < layer3_offset + IPV4_MIN_HEADER_LEN {
-        return Err("short ipv4 header".to_string());
+        debug!("G-01: skipped short ipv4 header");
+        return None;
     }
 
     let version_ihl = packet_bytes[layer3_offset];
     if version_ihl >> 4 != 4 {
-        return Err("not ipv4".to_string());
+        debug!("G-01: skipped non-ipv4 frame in ipv4 parser");
+        return None;
     }
 
     let ihl = ((version_ihl & 0x0f) as usize) * 4;
     if ihl < IPV4_MIN_HEADER_LEN || packet_bytes.len() < layer3_offset + ihl {
-        return Err("invalid ipv4 ihl".to_string());
+        debug!("G-01: skipped invalid ipv4 ihl");
+        return None;
     }
 
     let protocol_number = packet_bytes[layer3_offset + 9];
@@ -359,31 +369,40 @@ fn parse_ipv4(packet_bytes: &[u8], layer3_offset: usize) -> Result<ParsedL4, Str
 
     let layer4_offset = layer3_offset + ihl;
     if packet_bytes.len() < layer4_offset + 4 {
-        return Err("short l4 header".to_string());
+        debug!("G-01: skipped short ipv4 transport header");
+        return None;
     }
 
     let src_port = u16::from_be_bytes([packet_bytes[layer4_offset], packet_bytes[layer4_offset + 1]]);
     let dst_port =
         u16::from_be_bytes([packet_bytes[layer4_offset + 2], packet_bytes[layer4_offset + 3]]);
 
-    Ok(ParsedL4 {
+    let protocol = protocol_from_num(protocol_number);
+    if matches!(protocol, Protocol::Other(_)) {
+        debug!("G-01: skipped non-TCP/UDP ipv4 packet");
+        return None;
+    }
+
+    Some(ParsedL4 {
         src_ip: IpAddr::V4(src_ip),
         dst_ip: IpAddr::V4(dst_ip),
         src_port,
         dst_port,
-        protocol: protocol_from_num(protocol_number),
+        protocol,
     })
 }
 
 // Parses an IPv6 packet and extracts source/destination IP and L4 ports.
-fn parse_ipv6(packet_bytes: &[u8], layer3_offset: usize) -> Result<ParsedL4, String> {
+fn parse_ipv6(packet_bytes: &[u8], layer3_offset: usize) -> Option<ParsedL4> {
     if packet_bytes.len() < layer3_offset + IPV6_HEADER_LEN {
-        return Err("short ipv6 header".to_string());
+        debug!("G-01: skipped short ipv6 header");
+        return None;
     }
 
     let version = packet_bytes[layer3_offset] >> 4;
     if version != 6 {
-        return Err("not ipv6".to_string());
+        debug!("G-01: skipped non-ipv6 frame in ipv6 parser");
+        return None;
     }
 
     let next_header = packet_bytes[layer3_offset + 6];
@@ -392,31 +411,39 @@ fn parse_ipv6(packet_bytes: &[u8], layer3_offset: usize) -> Result<ParsedL4, Str
 
     let layer4_offset = layer3_offset + IPV6_HEADER_LEN;
     if packet_bytes.len() < layer4_offset + 4 {
-        return Err("short ipv6 l4 header".to_string());
+        debug!("G-01: skipped short ipv6 transport header");
+        return None;
     }
 
     let src_port = u16::from_be_bytes([packet_bytes[layer4_offset], packet_bytes[layer4_offset + 1]]);
     let dst_port =
         u16::from_be_bytes([packet_bytes[layer4_offset + 2], packet_bytes[layer4_offset + 3]]);
 
-    Ok(ParsedL4 {
+    let protocol = protocol_from_num(next_header);
+    if matches!(protocol, Protocol::Other(_)) {
+        debug!("G-01: skipped non-TCP/UDP ipv6 packet");
+        return None;
+    }
+
+    Some(ParsedL4 {
         src_ip: IpAddr::V6(src_ip),
         dst_ip: IpAddr::V6(dst_ip),
         src_port,
         dst_port,
-        protocol: protocol_from_num(next_header),
+        protocol,
     })
 }
 
 // Reads a single IPv6 address from a byte slice at the given start offset.
-fn read_ipv6_address(packet_bytes: &[u8], offset: usize) -> Result<Ipv6Addr, String> {
+fn read_ipv6_address(packet_bytes: &[u8], offset: usize) -> Option<Ipv6Addr> {
     if packet_bytes.len() < offset + 16 {
-        return Err("short ipv6 address".to_string());
+        debug!("G-01: skipped short ipv6 address field");
+        return None;
     }
 
     let mut addr_bytes = [0u8; 16];
     addr_bytes.copy_from_slice(&packet_bytes[offset..(offset + 16)]);
-    Ok(Ipv6Addr::from(addr_bytes))
+    Some(Ipv6Addr::from(addr_bytes))
 }
 
 // Maps the IP next-header value to the project protocol enum.

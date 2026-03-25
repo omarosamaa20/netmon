@@ -267,7 +267,7 @@ fn run_nft_script(script: &str) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn nft: {e}"))?;
+        .map_err(map_nft_spawn_error)?;
 
     if let Some(stdin) = child.stdin.as_mut() {
         stdin
@@ -293,7 +293,7 @@ fn run_nft_command<const N: usize>(args: [&str; N], ignore_exists: bool) -> Resu
     let output = Command::new("nft")
         .args(args)
         .output()
-        .map_err(|e| format!("failed to run nft: {e}"))?;
+        .map_err(map_nft_spawn_error)?;
 
     if output.status.success() {
         return Ok(());
@@ -305,6 +305,15 @@ fn run_nft_command<const N: usize>(args: [&str; N], ignore_exists: bool) -> Resu
     }
 
     Err(format!("nft command error: {stderr}"))
+}
+
+// G-10: provide a clear operator message when nftables CLI is missing.
+fn map_nft_spawn_error(err: std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return "Blocking failed: nft not found. Install with: sudo apt-get install nftables"
+            .to_string();
+    }
+    format!("failed to run nft: {err}")
 }
 
 // Finds nft rule handles by scanning chain lines with this process comment marker.
