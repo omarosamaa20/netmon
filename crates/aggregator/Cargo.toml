@@ -1,0 +1,10 @@
+[package]
+name = "aggregator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+capture = { path = "../capture" }
+resolver = { path = "../resolver" }
+controller = { path = "../controller" }
+log = { workspace = true }

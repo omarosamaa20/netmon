@@ -1,0 +1,12 @@
+[package]
+name = "resolver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+capture = { path = "../capture" }
+log = { workspace = true }
+netlink-sys = "0.8"
+netlink-packet-sock-diag = "0.4"
+netlink-packet-core = "0.7"
