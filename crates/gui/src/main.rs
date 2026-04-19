@@ -78,7 +78,9 @@ struct DeviceInfo {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortColumn {
     Pid,
+    Tid,
     Process,
+    Thread,
     User,
     ProtocolMix,
     TxRate,
@@ -273,6 +275,8 @@ impl NetmonApp {
                 SortColumn::RxRate10s => ten_second_avg(a.rx_history).cmp(&ten_second_avg(b.rx_history)),
                 SortColumn::TxTotal => a.tx_bytes.cmp(&b.tx_bytes),
                 SortColumn::RxTotal => a.rx_bytes.cmp(&b.rx_bytes),
+                SortColumn::Tid => a.info.tid.cmp(&b.info.tid),
+                SortColumn::Thread => a.info.thread_name.cmp(&b.info.thread_name),
             };
 
             if self.sort_ascending {
@@ -389,7 +393,7 @@ impl NetmonApp {
 
         // Phase I Lesson IF-1: export both short and medium rolling-rate windows.
         let header =
-            "pid,process,user,uid,tx_bytes,rx_bytes,tx_2s_avg,rx_2s_avg,tx_10s_avg,rx_10s_avg\n";
+            "pid,tid,process,thread,user,uid,tx_bytes,rx_bytes,tx_2s_avg,rx_2s_avg,tx_10s_avg,rx_10s_avg\n";
         if file.write_all(header.as_bytes()).is_err() {
             if let Ok(mut status) = self.status_snapshot.write() {
                 *status = "CSV export failed while writing header".to_string();
@@ -399,9 +403,11 @@ impl NetmonApp {
 
         for row in rows {
             let line = format!(
-                "{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 row.info.pid,
+                row.info.tid,
                 sanitize_csv(&row.info.name),
+                sanitize_csv(&row.info.thread_name),
                 sanitize_csv(&row.info.username),
                 row.info.uid,
                 row.tx_bytes,
@@ -753,6 +759,12 @@ fn draw_process_table(
         if ui.button("PID").clicked() {
             clicked_sort = Some(SortColumn::Pid);
         }
+        if ui.button("TID").clicked() {
+            clicked_sort = Some(SortColumn::Tid);
+        }
+        if ui.button("Thread").clicked() {
+            clicked_sort = Some(SortColumn::Thread);
+        }
         if ui.button("Process").clicked() {
             clicked_sort = Some(SortColumn::Process);
         }
@@ -780,6 +792,7 @@ fn draw_process_table(
         if ui.button("RX Total").clicked() {
             clicked_sort = Some(SortColumn::RxTotal);
         }
+
     });
 
     ScrollArea::vertical().max_height(PROCESS_TABLE_HEIGHT).show(ui, |ui| {
@@ -833,6 +846,8 @@ fn draw_process_table(
                     ui.label(RichText::new(format_bandwidth(rx_rate_10s)).color(hot_color));
                     ui.label(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color));
                     ui.label(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color));
+                    ui.label(RichText::new(row.info.tid.to_string()).color(hot_color));
+                    ui.label(RichText::new(row.info.thread_name.clone()).color(hot_color));
                 });
             });
             ui.separator();
@@ -887,6 +902,8 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
 // Draws the connection table header row.
 fn draw_connection_table_header(ui: &mut egui::Ui) {
     ui.label(RichText::new("PID").strong());
+    ui.label(RichText::new("TID").strong());
+    ui.label(RichText::new("Thread").strong());
     ui.label(RichText::new("Process").strong());
     // G-02/G-06: user ownership must be visible in active socket rows.
     ui.label(RichText::new("User").strong());

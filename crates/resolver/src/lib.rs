@@ -4,10 +4,9 @@
 //! SOCK_DIAG query and falling back to `/proc/net` parsing when needed.
 //!
 //! This crate is used by the aggregator to annotate `FlowRecord` values with
-//! process and user information. The primary strategy asks the kernel for
-//! socket metadata through Netlink in one dump, then joins socket inodes with
-//! `/proc/<PID>/fd` symlinks to obtain PIDs. The fallback path keeps behavior
-//! available in restricted environments where Netlink queries are blocked.
+//! process, thread, and user information. Thread-level resolution scans
+//! /proc/<PID>/task/<TID>/fd/ so that individual threads within a multi-threaded
+//! process are tracked separately.
 
 mod netlink;
 mod pid_map;
@@ -34,7 +33,11 @@ const UNKNOWN_LABEL: &str = "[unknown]";
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: u32,
+    /// Thread ID. Equals pid for the main thread; differs for worker threads.
+    pub tid: u32,
     pub name: String,
+    /// Name from /proc/<pid>/task/<tid>/comm. Same as `name` for main thread.
+    pub thread_name: String,
     pub uid: u32,
     pub username: String,
 }
@@ -47,7 +50,9 @@ pub struct ResolvedConnection {
     pub state: String,
     pub inode: u64,
     pub pid: u32,
+    pub tid: u32,
     pub process: String,
+    pub thread_name: String,
     pub uid: u32,
     pub username: String,
 }
@@ -80,29 +85,15 @@ impl ResolverCache {
         })
     }
 
-    // Refreshes the inode-to-process map using the best available strategy.
-    //
-    // Preferred path: Netlink SOCK_DIAG (see netlink.rs). This is the approach
-    // used internally by the `ss` command and recommended in our Phase I survey
-    // report. It queries the kernel atomically in a single round-trip and is
-    // significantly faster than /proc parsing on systems with many open sockets.
-    //
-    // Fallback path: /proc/net/ text parsing (see proc_fallback.rs). Used only
-    // when Netlink is unavailable. Slower and non-atomic, but works in all
-    // Linux environments.
     pub fn refresh(&mut self) -> Result<(), ResolverError> {
-        // Phase I Lesson NS-1: prefer Netlink SOCK_DIAG over /proc text scanning.
         let socket_inodes = match netlink::query_sockets() {
             Ok(inodes) => {
                 log::debug!("Netlink SOCK_DIAG query succeeded ({} sockets)", inodes.len());
                 inodes
             }
             Err(e) => {
-                // Phase I Lesson NS-2: keep a robust /proc fallback path when Netlink fails.
                 log::warn!(
-                    "Netlink SOCK_DIAG unavailable ({}), falling back to /proc/net/ parsing. \
-                     This is slower and produces point-in-time snapshots rather than \
-                     atomic kernel-side dumps.",
+                    "Netlink SOCK_DIAG unavailable ({}), falling back to /proc/net/ parsing.",
                     e
                 );
                 proc_fallback::read_proc_net().map_err(|fallback_error| {
@@ -129,14 +120,13 @@ impl ResolverCache {
 
     /// Refreshes cache only when stale according to the configured refresh period.
     pub fn refresh_if_needed(&mut self) -> Result<(), ResolverError> {
-        // Phase I Lesson NS-3: throttle expensive ownership refresh operations.
         if self.last_refresh.elapsed() < RESOLVER_REFRESH_PERIOD {
             return Ok(());
         }
         self.refresh()
     }
 
-    /// Finds process ownership for a flow by matching endpoints to cached sockets.
+    /// Finds process/thread ownership for a flow by matching endpoints to cached sockets.
     pub fn resolve_flow_owner(&mut self, flow: &FlowKey) -> Option<ProcessInfo> {
         let _ = self.refresh_if_needed();
 
@@ -195,31 +185,24 @@ impl Resolver {
         })
     }
 
-    /// Refreshes cache only when stale, preserving existing caller behavior.
     pub fn refresh_if_needed(&mut self) -> Result<(), ResolverError> {
         self.cache.refresh_if_needed()
     }
 
-    /// Resolves one captured flow to process ownership metadata.
     pub fn resolve_flow_owner(&mut self, flow: &FlowKey) -> Option<ProcessInfo> {
         self.cache.resolve_flow_owner(flow)
     }
 
-    /// Lists resolved connections from the current cache snapshot.
     pub fn list_connections(&mut self) -> Vec<ResolvedConnection> {
         self.cache.list_connections()
     }
 
-    /// Looks up process info by PID from the current cache snapshot.
     pub fn process_by_pid(&mut self, pid: u32) -> Option<ProcessInfo> {
         self.cache.process_by_pid(pid)
     }
 }
 
 /// Resolves one flow by creating a short-lived resolver instance.
-///
-/// This helper keeps compatibility with call sites that use function-style
-/// resolution instead of storing a long-lived `Resolver`.
 pub fn resolve(flow: &FlowKey) -> Option<ProcessInfo> {
     let mut resolver = Resolver::new().ok()?;
     let _ = resolver.refresh_if_needed();
@@ -244,7 +227,7 @@ pub fn scan_connections_for_pid(pid: u32) -> Vec<ResolvedConnection> {
         .collect()
 }
 
-// Builds inode-to-process rows by joining sockets with inode->PID scan results.
+// Builds inode-to-process rows by joining sockets with inode->PID/TID scan results.
 fn build_inode_process_map(
     socket_entries: &HashMap<u64, SocketEntry>,
     inode_pid_map: &HashMap<u64, InodePidEntry>,
@@ -253,7 +236,7 @@ fn build_inode_process_map(
     let mut inode_to_process = HashMap::with_capacity(socket_entries.len());
 
     for inode in socket_entries.keys() {
-        if let Some((pid, process_name, uid)) = inode_pid_map.get(inode) {
+        if let Some((pid, tid, process_name, thread_name, uid)) = inode_pid_map.get(inode) {
             let username = uid_map
                 .get(uid)
                 .cloned()
@@ -263,7 +246,9 @@ fn build_inode_process_map(
                 *inode,
                 ProcessInfo {
                     pid: *pid,
+                    tid: *tid,
                     name: process_name.clone(),
+                    thread_name: thread_name.clone(),
                     uid: *uid,
                     username,
                 },
@@ -273,7 +258,9 @@ fn build_inode_process_map(
                 *inode,
                 ProcessInfo {
                     pid: 0,
+                    tid: 0,
                     name: UNKNOWN_LABEL.to_string(),
+                    thread_name: UNKNOWN_LABEL.to_string(),
                     uid: 0,
                     username: UNKNOWN_LABEL.to_string(),
                 },
@@ -284,7 +271,7 @@ fn build_inode_process_map(
     inode_to_process
 }
 
-// Builds connection rows for GUI consumers from socket and PID metadata.
+// Builds connection rows for GUI consumers from socket and thread metadata.
 fn build_connections(
     socket_entries: &HashMap<u64, SocketEntry>,
     inode_pid_map: &HashMap<u64, InodePidEntry>,
@@ -294,10 +281,10 @@ fn build_connections(
 
     for socket_entry in socket_entries.values() {
         let default_uid = socket_entry.uid;
-        let (pid, process, uid) = inode_pid_map
+        let (pid, tid, process, thread_name, uid) = inode_pid_map
             .get(&socket_entry.inode)
             .cloned()
-            .unwrap_or((0, UNKNOWN_LABEL.to_string(), default_uid));
+            .unwrap_or((0, 0, UNKNOWN_LABEL.to_string(), UNKNOWN_LABEL.to_string(), default_uid));
         let username = uid_map
             .get(&uid)
             .cloned()
@@ -310,7 +297,9 @@ fn build_connections(
             state: socket_entry.state.clone(),
             inode: socket_entry.inode,
             pid,
+            tid,
             process,
+            thread_name,
             uid,
             username,
         });

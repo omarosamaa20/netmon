@@ -1,23 +1,25 @@
 #![deny(warnings)]
 
-//! Aggregates captured flow records into per-process counters and history
+//! Aggregates captured flow records into per-thread counters and history
 //! snapshots that the GUI can read each frame.
 //!
-//! This crate owns a background thread that receives `FlowRecord` items from a
-//! bounded mpsc channel, resolves ownership via the resolver cache, and updates
-//! process and interface statistics. The thread publishes read-friendly data
-//! through `Arc<RwLock<...>>` snapshots so the UI can render without touching
-//! mutable internal state. History values use a fixed-size ring-like array with
-//! the newest second at index zero.
+//! Traffic is now attributed to individual OS threads (PID + TID) rather than
+//! processes, giving finer-grained visibility into multi-threaded applications.
+//!
+//! Historical CSV export appends one timestamped row per active thread every
+//! second to a persistent file at ~/netmon_history_<timestamp>.csv, so the
+//! full capture session is preserved without manual exports.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use capture::{Direction, FlowRecord, Protocol};
 use resolver::{ProcessInfo, ResolvedConnection, Resolver};
@@ -34,18 +36,24 @@ const RESOLVER_SCAN_INTERVAL: Duration = Duration::from_millis(800);
 /// Sleep duration at the end of each loop iteration to cap CPU usage.
 const LOOP_SLEEP_INTERVAL: Duration = Duration::from_millis(10);
 
-/// G-03: evict inactive process rows after this idle period to bound memory.
+/// Evict inactive thread rows after this idle period to bound memory.
 const PROCESS_EVICTION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Placeholder process label when resolver cannot map a flow.
+/// Placeholder label when resolver cannot map a flow.
 const UNKNOWN_PROCESS_LABEL: &str = "[unknown]";
+
+/// Key used to track per-thread statistics: (pid, tid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadKey {
+    pub pid: u32,
+    pub tid: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct ProcessRow {
     pub info: ProcessInfo,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
-    // G-03: snapshot includes last activity timestamp for bounded retention.
     pub last_seen: Instant,
     pub tx_history: [u64; HISTORY_SLOTS],
     pub rx_history: [u64; HISTORY_SLOTS],
@@ -60,7 +68,9 @@ pub struct ConnectionEntry {
     pub protocol: Protocol,
     pub state: String,
     pub pid: u32,
+    pub tid: u32,
     pub process: String,
+    pub thread_name: String,
     pub username: String,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
@@ -77,7 +87,6 @@ pub struct InterfaceStats {
 }
 
 impl Default for InterfaceStats {
-    // Builds a zeroed interface statistics snapshot.
     fn default() -> Self {
         Self {
             tx_bytes_total: 0,
@@ -127,11 +136,10 @@ impl AggregatorControl {
 }
 
 #[derive(Debug, Clone)]
-struct ProcessStats {
+struct ThreadStats {
     info: ProcessInfo,
     tx_bytes_total: u64,
     rx_bytes_total: u64,
-    // G-03: used to evict inactive process entries after timeout.
     last_seen: Instant,
     tx_current_second: u64,
     rx_current_second: u64,
@@ -139,8 +147,7 @@ struct ProcessStats {
     rx_history: [u64; HISTORY_SLOTS],
 }
 
-impl ProcessStats {
-    // Creates zeroed counters for one process.
+impl ThreadStats {
     fn new(info: ProcessInfo) -> Self {
         Self {
             info,
@@ -154,7 +161,6 @@ impl ProcessStats {
         }
     }
 
-    // Rotates per-second histories so index 0 always holds the newest second.
     fn rotate_second(&mut self) {
         for idx in (1..HISTORY_SLOTS).rev() {
             self.tx_history[idx] = self.tx_history[idx - 1];
@@ -192,6 +198,76 @@ pub fn spawn_aggregator_thread(
     }
 }
 
+// Opens the historical CSV file and writes the header row.
+fn open_history_csv() -> Option<File> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = format!("{home}/netmon_history_{ts}.csv");
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+
+    let header = "timestamp,pid,tid,process,thread,user,uid,\
+                  tx_bytes_total,rx_bytes_total,\
+                  tx_2s_avg,rx_2s_avg,tx_10s_avg,rx_10s_avg\n";
+    file.write_all(header.as_bytes()).ok()?;
+
+    log::info!("Historical CSV opened at {path}");
+    Some(file)
+}
+
+// Appends one row per active thread to the history CSV on each second tick.
+fn append_history_csv(file: &mut File, stats_map: &HashMap<ThreadKey, ThreadStats>) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for stats in stats_map.values() {
+        let tx_2s = two_second_avg(stats.tx_history);
+        let rx_2s = two_second_avg(stats.rx_history);
+        let tx_10s = ten_second_avg(stats.tx_history);
+        let rx_10s = ten_second_avg(stats.rx_history);
+
+        let line = format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            ts,
+            stats.info.pid,
+            stats.info.tid,
+            sanitize_csv(&stats.info.name),
+            sanitize_csv(&stats.info.thread_name),
+            sanitize_csv(&stats.info.username),
+            stats.info.uid,
+            stats.tx_bytes_total,
+            stats.rx_bytes_total,
+            tx_2s,
+            rx_2s,
+            tx_10s,
+            rx_10s,
+        );
+
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn two_second_avg(history: [u64; HISTORY_SLOTS]) -> u64 {
+    (history[0] + history[1]) / 2
+}
+
+fn ten_second_avg(history: [u64; HISTORY_SLOTS]) -> u64 {
+    history[0..10].iter().copied().sum::<u64>() / 10
+}
+
+fn sanitize_csv(value: &str) -> String {
+    value.replace('"', "'").replace(',', " ")
+}
+
 // Runs the main aggregator lifecycle from channel reads to snapshot publication.
 fn run_aggregator_loop(
     rx: Receiver<FlowRecord>,
@@ -211,7 +287,8 @@ fn run_aggregator_loop(
         }
     };
 
-    let mut stats_by_pid: HashMap<u32, ProcessStats> = HashMap::new();
+    // Keyed by (pid, tid) for per-thread attribution.
+    let mut stats_by_thread: HashMap<ThreadKey, ThreadStats> = HashMap::new();
     let mut last_rotation = Instant::now();
     let mut last_proc_scan = Instant::now() - Duration::from_secs(1);
     let mut connection_cache: Vec<ResolvedConnection> = Vec::new();
@@ -224,21 +301,27 @@ fn run_aggregator_loop(
     let mut if_rx_history: [u64; HISTORY_SLOTS] = [0; HISTORY_SLOTS];
     let mut peak_bw: u64 = 0;
 
+    let mut history_csv = open_history_csv();
+    if history_csv.is_none() {
+        log::warn!("Could not open historical CSV file; history will not be saved.");
+    }
+
     while running.load(Ordering::Relaxed) {
         drain_flow_channel(
             &rx,
             &mut resolver,
-            &mut stats_by_pid,
+            &mut stats_by_thread,
             &mut if_tx_total,
             &mut if_rx_total,
             &mut if_tx_current_second,
             &mut if_rx_current_second,
         );
         refresh_connection_cache_if_due(&mut resolver, &mut connection_cache, &mut last_proc_scan);
-        mark_exited_processes(&mut stats_by_pid, &mut resolver);
-        evict_stale_processes(&mut stats_by_pid);
-        rotate_histories_if_due(
-            &mut stats_by_pid,
+        mark_exited_threads(&mut stats_by_thread, &mut resolver);
+        evict_stale_threads(&mut stats_by_thread);
+
+        let rotated = rotate_histories_if_due(
+            &mut stats_by_thread,
             &mut if_tx_history,
             &mut if_rx_history,
             &mut if_tx_current_second,
@@ -246,8 +329,16 @@ fn run_aggregator_loop(
             &mut peak_bw,
             &mut last_rotation,
         );
+
+        // Append one CSV snapshot per second tick.
+        if rotated {
+            if let Some(ref mut csv_file) = history_csv {
+                append_history_csv(csv_file, &stats_by_thread);
+            }
+        }
+
         publish_snapshots(
-            &stats_by_pid,
+            &stats_by_thread,
             &connection_cache,
             &rows_snapshot,
             &interface_snapshot,
@@ -258,7 +349,7 @@ fn run_aggregator_loop(
             if_tx_history,
             if_rx_history,
         );
-        // G-03: explicit small sleep prevents busy-waiting in the aggregator loop.
+
         thread::sleep(LOOP_SLEEP_INTERVAL);
     }
 }
@@ -267,19 +358,18 @@ fn run_aggregator_loop(
 fn drain_flow_channel(
     rx: &Receiver<FlowRecord>,
     resolver: &mut Resolver,
-    stats_by_pid: &mut HashMap<u32, ProcessStats>,
+    stats_by_thread: &mut HashMap<ThreadKey, ThreadStats>,
     if_tx_total: &mut u64,
     if_rx_total: &mut u64,
     if_tx_current_second: &mut u64,
     if_rx_current_second: &mut u64,
 ) {
-    // G-03: bounded channel reads plus timeout provide back-pressure without unbounded queues.
     match rx.recv_timeout(CHANNEL_RECV_TIMEOUT) {
         Ok(first_record) => {
             process_record(
                 first_record,
                 resolver,
-                stats_by_pid,
+                stats_by_thread,
                 if_tx_total,
                 if_rx_total,
                 if_tx_current_second,
@@ -290,7 +380,7 @@ fn drain_flow_channel(
                 process_record(
                     next_record,
                     resolver,
-                    stats_by_pid,
+                    stats_by_thread,
                     if_tx_total,
                     if_rx_total,
                     if_tx_current_second,
@@ -303,22 +393,26 @@ fn drain_flow_channel(
     }
 }
 
-// G-10: mark rows as exited when PID no longer resolves but retention window has not elapsed.
-fn mark_exited_processes(stats_by_pid: &mut HashMap<u32, ProcessStats>, resolver: &mut Resolver) {
-    for (pid, stats) in stats_by_pid.iter_mut() {
-        if *pid == 0 {
+// Marks rows as exited when the PID no longer resolves.
+fn mark_exited_threads(
+    stats_by_thread: &mut HashMap<ThreadKey, ThreadStats>,
+    resolver: &mut Resolver,
+) {
+    for (key, stats) in stats_by_thread.iter_mut() {
+        if key.pid == 0 {
             continue;
         }
-
-        if resolver.process_by_pid(*pid).is_none() && !stats.info.name.ends_with(" [exited]") {
+        if resolver.process_by_pid(key.pid).is_none()
+            && !stats.info.name.ends_with(" [exited]")
+        {
             stats.info.name = format!("{} [exited]", stats.info.name);
         }
     }
 }
 
-// G-03: remove stale process entries so the per-process map remains memory-bounded.
-fn evict_stale_processes(stats_by_pid: &mut HashMap<u32, ProcessStats>) {
-    stats_by_pid.retain(|_, stats| stats.last_seen.elapsed() <= PROCESS_EVICTION_TIMEOUT);
+// Removes stale thread entries to keep the map memory-bounded.
+fn evict_stale_threads(stats_by_thread: &mut HashMap<ThreadKey, ThreadStats>) {
+    stats_by_thread.retain(|_, stats| stats.last_seen.elapsed() <= PROCESS_EVICTION_TIMEOUT);
 }
 
 // Refreshes connection metadata from resolver cache at most once per interval.
@@ -327,7 +421,6 @@ fn refresh_connection_cache_if_due(
     connection_cache: &mut Vec<ResolvedConnection>,
     last_proc_scan: &mut Instant,
 ) {
-    // Phase I Lesson NS-3: avoid per-packet resolver scans by using a timed refresh window.
     if last_proc_scan.elapsed() >= RESOLVER_SCAN_INTERVAL {
         let _ = resolver.refresh_if_needed();
         *connection_cache = resolver.list_connections();
@@ -335,22 +428,22 @@ fn refresh_connection_cache_if_due(
     }
 }
 
-// Rotates per-second histories and updates interface peak bandwidth.
+// Rotates per-second histories and returns true when a rotation occurred.
 fn rotate_histories_if_due(
-    stats_by_pid: &mut HashMap<u32, ProcessStats>,
+    stats_by_thread: &mut HashMap<ThreadKey, ThreadStats>,
     if_tx_history: &mut [u64; HISTORY_SLOTS],
     if_rx_history: &mut [u64; HISTORY_SLOTS],
     if_tx_current_second: &mut u64,
     if_rx_current_second: &mut u64,
     peak_bw: &mut u64,
     last_rotation: &mut Instant,
-) {
+) -> bool {
     if last_rotation.elapsed() < Duration::from_secs(1) {
-        return;
+        return false;
     }
 
-    for process_stats in stats_by_pid.values_mut() {
-        process_stats.rotate_second();
+    for thread_stats in stats_by_thread.values_mut() {
+        thread_stats.rotate_second();
     }
 
     rotate_interface_second(
@@ -365,13 +458,14 @@ fn rotate_histories_if_due(
         *peak_bw = current_bandwidth;
     }
     *last_rotation = Instant::now();
+    true
 }
 
-// Applies one flow record to process-level and interface-level counters.
+// Applies one flow record to thread-level and interface-level counters.
 fn process_record(
     record: FlowRecord,
     resolver: &mut Resolver,
-    stats_by_pid: &mut HashMap<u32, ProcessStats>,
+    stats_by_thread: &mut HashMap<ThreadKey, ThreadStats>,
     if_tx_total: &mut u64,
     if_rx_total: &mut u64,
     if_tx_current_second: &mut u64,
@@ -381,15 +475,18 @@ fn process_record(
         .resolve_flow_owner(&record.key)
         .unwrap_or(ProcessInfo {
             pid: 0,
+            tid: 0,
             name: UNKNOWN_PROCESS_LABEL.to_string(),
+            thread_name: UNKNOWN_PROCESS_LABEL.to_string(),
             uid: 0,
             username: UNKNOWN_PROCESS_LABEL.to_string(),
         });
 
+    let key = ThreadKey { pid: info.pid, tid: info.tid };
     let bytes = u64::from(record.byte_count);
-    let entry = stats_by_pid
-        .entry(info.pid)
-        .or_insert_with(|| ProcessStats::new(info.clone()));
+    let entry = stats_by_thread
+        .entry(key)
+        .or_insert_with(|| ThreadStats::new(info.clone()));
     entry.info = info;
     entry.last_seen = Instant::now();
 
@@ -426,9 +523,9 @@ fn rotate_interface_second(
     *rx_current_second = 0;
 }
 
-// Publishes process and interface snapshots to shared `Arc<RwLock<...>>` state.
+// Publishes thread and interface snapshots to shared Arc<RwLock<...>> state.
 fn publish_snapshots(
-    stats_by_pid: &HashMap<u32, ProcessStats>,
+    stats_by_thread: &HashMap<ThreadKey, ThreadStats>,
     connection_cache: &[ResolvedConnection],
     rows_snapshot: &Arc<RwLock<Vec<ProcessRow>>>,
     interface_snapshot: &Arc<RwLock<InterfaceStats>>,
@@ -444,10 +541,12 @@ fn publish_snapshots(
         .map(|g| g.clone())
         .unwrap_or_else(|_| HashSet::new());
 
-    let mut conn_by_pid: HashMap<u32, Vec<ConnectionEntry>> = HashMap::new();
+    // Build connection list keyed by (pid, tid).
+    let mut conn_by_thread: HashMap<ThreadKey, Vec<ConnectionEntry>> = HashMap::new();
     for conn in connection_cache {
-        conn_by_pid
-            .entry(conn.pid)
+        let key = ThreadKey { pid: conn.pid, tid: conn.tid };
+        conn_by_thread
+            .entry(key)
             .or_default()
             .push(ConnectionEntry {
                 local_addr: conn.local_addr,
@@ -455,15 +554,17 @@ fn publish_snapshots(
                 protocol: conn.protocol,
                 state: conn.state.clone(),
                 pid: conn.pid,
+                tid: conn.tid,
                 process: conn.process.clone(),
+                thread_name: conn.thread_name.clone(),
                 username: conn.username.clone(),
                 tx_bytes: 0,
                 rx_bytes: 0,
             });
     }
 
-    let mut rows = Vec::with_capacity(stats_by_pid.len());
-    for (pid, stats) in stats_by_pid {
+    let mut rows = Vec::with_capacity(stats_by_thread.len());
+    for (key, stats) in stats_by_thread {
         rows.push(ProcessRow {
             info: stats.info.clone(),
             tx_bytes: stats.tx_bytes_total,
@@ -471,12 +572,13 @@ fn publish_snapshots(
             last_seen: stats.last_seen,
             tx_history: stats.tx_history,
             rx_history: stats.rx_history,
-            is_blocked: blocked.contains(pid),
-            connections: conn_by_pid.remove(pid).unwrap_or_default(),
+            is_blocked: blocked.contains(&key.pid),
+            connections: conn_by_thread.remove(key).unwrap_or_default(),
         });
     }
 
-    rows.sort_by_key(|r| r.info.pid);
+    // Sort by PID then TID for consistent ordering.
+    rows.sort_by_key(|r| (r.info.pid, r.info.tid));
 
     if let Ok(mut guard) = rows_snapshot.write() {
         *guard = rows;
