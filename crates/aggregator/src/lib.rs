@@ -77,6 +77,23 @@ pub struct ConnectionEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct HistoryRow {
+    pub timestamp: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub process: String,
+    pub thread: String,
+    pub user: String,
+    pub uid: u32,
+    pub tx_bytes_total: u64,
+    pub rx_bytes_total: u64,
+    pub tx_2s_avg: u64,
+    pub rx_2s_avg: u64,
+    pub tx_10s_avg: u64,
+    pub rx_10s_avg: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct InterfaceStats {
     pub tx_bytes_total: u64,
     pub rx_bytes_total: u64,
@@ -179,6 +196,7 @@ pub fn spawn_aggregator_thread(
     running: Arc<AtomicBool>,
     rows_snapshot: Arc<RwLock<Vec<ProcessRow>>>,
     interface_snapshot: Arc<RwLock<InterfaceStats>>,
+    history_snapshot: Arc<RwLock<Vec<HistoryRow>>>,
     status_snapshot: Arc<RwLock<String>>,
     blocked_pids: Arc<RwLock<HashSet<u32>>>,
 ) -> AggregatorControl {
@@ -188,6 +206,7 @@ pub fn spawn_aggregator_thread(
             running,
             rows_snapshot,
             interface_snapshot,
+            history_snapshot,
             status_snapshot,
             blocked_pids,
         );
@@ -223,33 +242,51 @@ fn open_history_csv() -> Option<File> {
 }
 
 // Appends one row per active thread to the history CSV on each second tick.
-fn append_history_csv(file: &mut File, stats_map: &HashMap<ThreadKey, ThreadStats>) {
+fn build_history_rows(stats_map: &HashMap<ThreadKey, ThreadStats>) -> Vec<HistoryRow> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    let mut rows = Vec::with_capacity(stats_map.len());
     for stats in stats_map.values() {
-        let tx_2s = two_second_avg(stats.tx_history);
-        let rx_2s = two_second_avg(stats.rx_history);
-        let tx_10s = ten_second_avg(stats.tx_history);
-        let rx_10s = ten_second_avg(stats.rx_history);
+        rows.push(HistoryRow {
+            timestamp: ts,
+            pid: stats.info.pid,
+            tid: stats.info.tid,
+            process: sanitize_csv(&stats.info.name),
+            thread: sanitize_csv(&stats.info.thread_name),
+            user: sanitize_csv(&stats.info.username),
+            uid: stats.info.uid,
+            tx_bytes_total: stats.tx_bytes_total,
+            rx_bytes_total: stats.rx_bytes_total,
+            tx_2s_avg: two_second_avg(stats.tx_history),
+            rx_2s_avg: two_second_avg(stats.rx_history),
+            tx_10s_avg: ten_second_avg(stats.tx_history),
+            rx_10s_avg: ten_second_avg(stats.rx_history),
+        });
+    }
 
+    rows
+}
+
+fn append_history_csv(file: &mut File, history_rows: &[HistoryRow]) {
+    for row in history_rows {
         let line = format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            ts,
-            stats.info.pid,
-            stats.info.tid,
-            sanitize_csv(&stats.info.name),
-            sanitize_csv(&stats.info.thread_name),
-            sanitize_csv(&stats.info.username),
-            stats.info.uid,
-            stats.tx_bytes_total,
-            stats.rx_bytes_total,
-            tx_2s,
-            rx_2s,
-            tx_10s,
-            rx_10s,
+            row.timestamp,
+            row.pid,
+            row.tid,
+            row.process,
+            row.thread,
+            row.user,
+            row.uid,
+            row.tx_bytes_total,
+            row.rx_bytes_total,
+            row.tx_2s_avg,
+            row.rx_2s_avg,
+            row.tx_10s_avg,
+            row.rx_10s_avg,
         );
 
         let _ = file.write_all(line.as_bytes());
@@ -274,6 +311,7 @@ fn run_aggregator_loop(
     running: Arc<AtomicBool>,
     rows_snapshot: Arc<RwLock<Vec<ProcessRow>>>,
     interface_snapshot: Arc<RwLock<InterfaceStats>>,
+    history_snapshot: Arc<RwLock<Vec<HistoryRow>>>,
     status_snapshot: Arc<RwLock<String>>,
     blocked_pids: Arc<RwLock<HashSet<u32>>>,
 ) {
@@ -333,7 +371,11 @@ fn run_aggregator_loop(
         // Append one CSV snapshot per second tick.
         if rotated {
             if let Some(ref mut csv_file) = history_csv {
-                append_history_csv(csv_file, &stats_by_thread);
+                let history_rows = build_history_rows(&stats_by_thread);
+                append_history_csv(csv_file, &history_rows);
+                if let Ok(mut guard) = history_snapshot.write() {
+                    guard.extend(history_rows);
+                }
             }
         }
 

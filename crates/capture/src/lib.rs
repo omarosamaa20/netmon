@@ -10,6 +10,7 @@
 //! per-packet payload inspection is out of scope for this project.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use log::{debug, error};
-use pcap::{Active, Capture};
+use pcap::{Active, Capture, Savefile};
 use thiserror::Error;
 
 /// libpcap capture buffer size in bytes.
@@ -107,6 +108,7 @@ pub enum CaptureCommand {
 pub struct CaptureControl {
     cmd_tx: Sender<CaptureCommand>,
     join_handle: Option<JoinHandle<()>>,
+    recording_path: Option<PathBuf>,
 }
 
 impl CaptureControl {
@@ -122,6 +124,11 @@ impl CaptureControl {
         self.cmd_tx
             .send(CaptureCommand::Stop)
             .map_err(|e| CaptureError::ChannelSend(e.to_string()))
+    }
+
+    /// Returns the path of the current session pcap recording, if any.
+    pub fn recording_path(&self) -> Option<&Path> {
+        self.recording_path.as_deref()
     }
 
     /// Joins the capture thread and propagates panic state as an error.
@@ -182,6 +189,15 @@ pub fn spawn_capture_thread(
         .timeout(PCAP_READ_TIMEOUT_MS)
         .open()?;
 
+    let recording_path = default_recording_path(interface);
+    let savefile = match capture.savefile(&recording_path) {
+        Ok(savefile) => Some(savefile),
+        Err(error) => {
+            let _ = status_tx.send(format!("PCAP recording disabled: {error}"));
+            None
+        }
+    };
+
     let (command_sender, command_receiver) = mpsc::channel::<CaptureCommand>();
     let status_interface = interface.to_string();
 
@@ -194,12 +210,14 @@ pub fn spawn_capture_thread(
             running,
             command_receiver,
             status_tx,
+            savefile,
         );
     });
 
     Ok(CaptureControl {
         cmd_tx: command_sender,
         join_handle: Some(join_handle),
+        recording_path: Some(recording_path),
     })
 }
 
@@ -211,6 +229,7 @@ fn run_capture_loop(
     running: Arc<AtomicBool>,
     command_receiver: Receiver<CaptureCommand>,
     status_tx: Sender<String>,
+    mut savefile: Option<Savefile>,
 ) {
     while running.load(Ordering::Relaxed) {
         if handle_pending_commands(capture, &command_receiver, &status_tx) {
@@ -219,6 +238,10 @@ fn run_capture_loop(
 
         match capture.next_packet() {
             Ok(packet) => {
+                if let Some(ref mut file) = savefile {
+                    file.write(&[packet]);
+                }
+
                 if let Some(record) = parse_packet(packet.data, packet.header.len, local_ips) {
                     if flow_sender.send(record).is_err() {
                         return;
@@ -237,6 +260,20 @@ fn run_capture_loop(
             }
         }
     }
+}
+
+// Builds a stable recording path for one capture session.
+fn default_recording_path(interface: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let safe_interface = interface
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .collect::<String>();
+    PathBuf::from(format!("{home}/netmon_capture_{safe_interface}_{ts}.pcap"))
 }
 
 // Handles queued control commands and returns true when capture should stop.
