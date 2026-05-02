@@ -27,10 +27,13 @@ use eframe::{App, Frame};
 use egui_plot::{Line, Plot, PlotPoints};
 
 /// Number of history points shown in traffic charts.
-const CHART_HISTORY_SECONDS: usize = 40;
+const CHART_HISTORY_SECONDS: usize = 300;
+
+/// Number of samples used for short rolling rates.
+const SHORT_RATE_WINDOW_SECONDS: usize = 2;
 
 /// Default number of seconds shown by the live chart.
-const DEFAULT_CHART_WINDOW_SECONDS: usize = 40;
+const DEFAULT_CHART_WINDOW_SECONDS: usize = 60;
 
 /// UI repaint interval in milliseconds.
 const UI_REPAINT_INTERVAL_MS: u64 = 16;
@@ -43,6 +46,9 @@ const PROCESS_TABLE_HEIGHT: f32 = 320.0;
 
 /// Height of the connection table scroll area.
 const CONNECTION_TABLE_HEIGHT: f32 = 250.0;
+
+/// Width at which the process/chart area switches from split to stacked.
+const RESPONSIVE_STACK_WIDTH: f32 = 1200.0;
 
 /// Height of the bandwidth chart area.
 const CHART_HEIGHT: f32 = 300.0;
@@ -131,8 +137,6 @@ enum SortColumn {
     ProtocolMix,
     TxRate,
     RxRate,
-    TxRate10s,
-    RxRate10s,
     TxTotal,
     RxTotal,
 }
@@ -339,10 +343,8 @@ impl NetmonApp {
                 SortColumn::Process => a.info.name.cmp(&b.info.name),
                 SortColumn::User => a.info.username.cmp(&b.info.username),
                 SortColumn::ProtocolMix => protocol_mix_summary(a).cmp(&protocol_mix_summary(b)),
-                SortColumn::TxRate => two_second_avg(a.tx_history).cmp(&two_second_avg(b.tx_history)),
-                SortColumn::RxRate => two_second_avg(a.rx_history).cmp(&two_second_avg(b.rx_history)),
-                SortColumn::TxRate10s => ten_second_avg(a.tx_history).cmp(&ten_second_avg(b.tx_history)),
-                SortColumn::RxRate10s => ten_second_avg(a.rx_history).cmp(&ten_second_avg(b.rx_history)),
+                SortColumn::TxRate => two_second_avg(&a.tx_history).cmp(&two_second_avg(&b.tx_history)),
+                SortColumn::RxRate => two_second_avg(&a.rx_history).cmp(&two_second_avg(&b.rx_history)),
                 SortColumn::TxTotal => a.tx_bytes.cmp(&b.tx_bytes),
                 SortColumn::RxTotal => a.rx_bytes.cmp(&b.rx_bytes),
                 SortColumn::Tid => a.info.tid.cmp(&b.info.tid),
@@ -618,8 +620,9 @@ impl NetmonApp {
             ui.label("Chart window:");
             ui.add(egui::Slider::new(
                 &mut self.chart_window_seconds,
-                1..=CHART_HISTORY_SECONDS,
+                30..=CHART_HISTORY_SECONDS,
             )
+            .step_by(10.0)
             .suffix("s"));
 
             if ui.button("Export CSV").clicked() {
@@ -702,17 +705,18 @@ impl NetmonApp {
         });
     }
 
-    // Renders the side-by-side process table and chart sections.
+    // Renders the process table and chart in either split or stacked form.
     fn render_process_and_chart_columns(&mut self, ui: &mut egui::Ui, sorted_rows: &[ProcessRow]) {
-        ui.columns(2, |columns| {
-            columns[0].vertical(|ui| {
+        let available_width = ui.available_width();
+
+        if available_width < RESPONSIVE_STACK_WIDTH {
+            ui.vertical(|ui| {
                 ui.heading("Processes");
                 if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_thread) {
                     self.set_sort(column);
                 }
-            });
 
-            columns[1].vertical(|ui| {
+                ui.separator();
                 ui.heading(format!("Chart (Last {}s)", self.chart_window_seconds));
                 draw_chart(
                     ui,
@@ -722,7 +726,27 @@ impl NetmonApp {
                     self.chart_window_seconds,
                 );
             });
-        });
+        } else {
+            ui.columns(2, |columns| {
+                columns[0].vertical(|ui| {
+                    ui.heading("Processes");
+                    if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_thread) {
+                        self.set_sort(column);
+                    }
+                });
+
+                columns[1].vertical(|ui| {
+                    ui.heading(format!("Chart (Last {}s)", self.chart_window_seconds));
+                    draw_chart(
+                        ui,
+                        sorted_rows,
+                        self.selected_thread,
+                        self.show_bits,
+                        self.chart_window_seconds,
+                    );
+                });
+            });
+        }
 
         self.render_selected_row_controls(ui, sorted_rows);
     }
@@ -786,7 +810,7 @@ impl NetmonApp {
             }
         }
 
-        ScrollArea::vertical().max_height(CONNECTION_TABLE_HEIGHT).show(ui, |ui| {
+        ScrollArea::both().max_height(CONNECTION_TABLE_HEIGHT).show(ui, |ui| {
             egui::Grid::new("conn_grid").striped(true).show(ui, |ui| {
                 draw_connection_table_header(ui);
                 for (is_blocked, connection) in &visible_connections {
@@ -972,69 +996,73 @@ fn draw_process_table(
     selected_thread: &mut Option<ThreadKey>,
  ) -> Option<SortColumn> {
     let mut clicked_sort = None;
+    let available_width = ui.available_width();
+    let base_total_width = PROCESS_PID_WIDTH
+        + PROCESS_NAME_WIDTH
+        + USER_COLUMN_MIN_WIDTH
+        + (PROCESS_BW_WIDTH * 3.0)
+        + (PROCESS_TOTAL_WIDTH * 2.0)
+        + PROCESS_TID_WIDTH
+        + PROCESS_THREAD_WIDTH;
+    let width_scale = (available_width / base_total_width).clamp(0.55, 1.6);
+    let pid_width = PROCESS_PID_WIDTH * width_scale;
+    let process_width = PROCESS_NAME_WIDTH * width_scale;
+    let user_width = USER_COLUMN_MIN_WIDTH * width_scale;
+    let bw_width = PROCESS_BW_WIDTH * width_scale;
+    let total_width = PROCESS_TOTAL_WIDTH * width_scale;
+    let tid_width = PROCESS_TID_WIDTH * width_scale;
+    let thread_width = PROCESS_THREAD_WIDTH * width_scale;
 
     egui::Grid::new("process_header_grid")
         .striped(true)
         .show(ui, |ui| {
-            if ui.add_sized([PROCESS_PID_WIDTH, 18.0], egui::Button::new("PID")).clicked() {
+            if ui.add_sized([pid_width, 18.0], egui::Button::new("PID")).clicked() {
                 clicked_sort = Some(SortColumn::Pid);
             }
             if ui
-                .add_sized([PROCESS_NAME_WIDTH, 18.0], egui::Button::new("Process"))
+                .add_sized([process_width, 18.0], egui::Button::new("Process"))
                 .clicked()
             {
                 clicked_sort = Some(SortColumn::Process);
             }
             if ui
-                .add_sized([USER_COLUMN_MIN_WIDTH, 18.0], egui::Button::new("User"))
+                .add_sized([user_width, 18.0], egui::Button::new("User"))
                 .clicked()
             {
                 clicked_sort = Some(SortColumn::User);
             }
-            if ui.add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("Proto Mix")).clicked() {
+            if ui.add_sized([bw_width, 18.0], egui::Button::new("Proto Mix")).clicked() {
                 clicked_sort = Some(SortColumn::ProtocolMix);
             }
             if ui
-                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("TX/s (2s)"))
+                .add_sized([bw_width, 18.0], egui::Button::new("TX/s (2s)"))
                 .clicked()
             {
                 clicked_sort = Some(SortColumn::TxRate);
             }
             if ui
-                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("RX/s (2s)"))
+                .add_sized([bw_width, 18.0], egui::Button::new("RX/s (2s)"))
                 .clicked()
             {
                 clicked_sort = Some(SortColumn::RxRate);
             }
             if ui
-                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("TX/s (10s)"))
-                .clicked()
-            {
-                clicked_sort = Some(SortColumn::TxRate10s);
-            }
-            if ui
-                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("RX/s (10s)"))
-                .clicked()
-            {
-                clicked_sort = Some(SortColumn::RxRate10s);
-            }
-            if ui
-                .add_sized([PROCESS_TOTAL_WIDTH, 18.0], egui::Button::new("TX Total"))
+                .add_sized([total_width, 18.0], egui::Button::new("TX Total"))
                 .clicked()
             {
                 clicked_sort = Some(SortColumn::TxTotal);
             }
             if ui
-                .add_sized([PROCESS_TOTAL_WIDTH, 18.0], egui::Button::new("RX Total"))
+                .add_sized([total_width, 18.0], egui::Button::new("RX Total"))
                 .clicked()
             {
                 clicked_sort = Some(SortColumn::RxTotal);
             }
-            if ui.add_sized([PROCESS_PID_WIDTH, 18.0], egui::Button::new("TID")).clicked() {
+            if ui.add_sized([tid_width, 18.0], egui::Button::new("TID")).clicked() {
                 clicked_sort = Some(SortColumn::Tid);
             }
             if ui
-                .add_sized([PROCESS_THREAD_WIDTH, 18.0], egui::Button::new("Thread"))
+                .add_sized([thread_width, 18.0], egui::Button::new("Thread"))
                 .clicked()
             {
                 clicked_sort = Some(SortColumn::Thread);
@@ -1042,15 +1070,10 @@ fn draw_process_table(
             ui.end_row();
         });
 
-    ScrollArea::vertical().max_height(PROCESS_TABLE_HEIGHT).show(ui, |ui| {
-        egui::Grid::new("process_row_grid")
-            .striped(true)
-            .show(ui, |ui| {
-                for row in rows {
-            let tx_rate = two_second_avg(row.tx_history);
-            let rx_rate = two_second_avg(row.rx_history);
-            let tx_rate_10s = ten_second_avg(row.tx_history);
-            let rx_rate_10s = ten_second_avg(row.rx_history);
+    ScrollArea::both().max_height(PROCESS_TABLE_HEIGHT).show(ui, |ui| {
+        for row in rows {
+            let tx_rate = two_second_avg(&row.tx_history);
+            let rx_rate = two_second_avg(&row.rx_history);
             // Phase I Lesson IF-3: highlight heavy senders to improve operator response speed.
             let hot_color = if tx_rate > VERY_HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
                 || rx_rate > VERY_HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
@@ -1071,67 +1094,59 @@ fn draw_process_table(
             };
 
             egui::Frame::none().fill(row_fill).show(ui, |ui| {
-                let selected = *selected_thread == Some(ThreadKey { pid: row.info.pid, tid: row.info.tid });
-                let pid_response = ui.add_sized(
-                    [PROCESS_PID_WIDTH, 18.0],
-                    egui::Button::new(RichText::new(row.info.pid.to_string()).color(hot_color)).selected(selected),
-                );
-                if pid_response.clicked() {
-                    if selected {
-                        *selected_thread = None;
-                    } else {
-                        *selected_thread = Some(ThreadKey { pid: row.info.pid, tid: row.info.tid });
+                ui.horizontal(|ui| {
+                    let selected = *selected_thread == Some(ThreadKey { pid: row.info.pid, tid: row.info.tid });
+                    let pid_response = ui.add_sized(
+                        [pid_width, 18.0],
+                        egui::Button::new(RichText::new(row.info.pid.to_string()).color(hot_color)).selected(selected),
+                    );
+                    if pid_response.clicked() {
+                        if selected {
+                            *selected_thread = None;
+                        } else {
+                            *selected_thread = Some(ThreadKey { pid: row.info.pid, tid: row.info.tid });
+                        }
                     }
-                }
-                ui.add_sized(
-                    [PROCESS_NAME_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(row.info.name.clone()).color(hot_color)),
-                );
-                let user_text = RichText::new(row.info.username.clone()).color(hot_color);
-                ui.add_sized([USER_COLUMN_MIN_WIDTH, 18.0], egui::Label::new(user_text));
-                // Phase I Lesson WS-4: keep protocol split visible in the process table.
-                ui.add_sized(
-                    [PROCESS_BW_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(protocol_mix_summary(row)).color(hot_color)),
-                );
-                // G-05: display throughput in human-readable per-second units.
-                ui.add_sized(
-                    [PROCESS_BW_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(format_bandwidth(tx_rate)).color(hot_color)),
-                );
-                ui.add_sized(
-                    [PROCESS_BW_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(format_bandwidth(rx_rate)).color(hot_color)),
-                );
-                // Phase I Lesson IF-1: expose a smoother 10-second rate alongside 2-second rate.
-                ui.add_sized(
-                    [PROCESS_BW_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(format_bandwidth(tx_rate_10s)).color(hot_color)),
-                );
-                ui.add_sized(
-                    [PROCESS_BW_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(format_bandwidth(rx_rate_10s)).color(hot_color)),
-                );
-                ui.add_sized(
-                    [PROCESS_TOTAL_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color)),
-                );
-                ui.add_sized(
-                    [PROCESS_TOTAL_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color)),
-                );
-                ui.add_sized(
-                    [PROCESS_TID_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(row.info.tid.to_string()).color(hot_color)),
-                );
-                ui.add_sized(
-                    [PROCESS_THREAD_WIDTH, 18.0],
-                    egui::Label::new(RichText::new(row.info.thread_name.clone()).color(hot_color)),
-                );
-                ui.end_row();
+                    ui.add_sized(
+                        [process_width, 18.0],
+                        egui::Label::new(RichText::new(row.info.name.clone()).color(hot_color)),
+                    );
+                    let user_text = RichText::new(row.info.username.clone()).color(hot_color);
+                    ui.add_sized([user_width, 18.0], egui::Label::new(user_text));
+                    // Phase I Lesson WS-4: keep protocol split visible in the process table.
+                    ui.add_sized(
+                        [bw_width, 18.0],
+                        egui::Label::new(RichText::new(protocol_mix_summary(row)).color(hot_color)),
+                    );
+                    // G-05: display throughput in human-readable per-second units.
+                    ui.add_sized(
+                        [bw_width, 18.0],
+                        egui::Label::new(RichText::new(format_bandwidth(tx_rate)).color(hot_color)),
+                    );
+                    ui.add_sized(
+                        [bw_width, 18.0],
+                        egui::Label::new(RichText::new(format_bandwidth(rx_rate)).color(hot_color)),
+                    );
+                    ui.add_sized(
+                        [total_width, 18.0],
+                        egui::Label::new(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color)),
+                    );
+                    ui.add_sized(
+                        [total_width, 18.0],
+                        egui::Label::new(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color)),
+                    );
+                    ui.add_sized(
+                        [tid_width, 18.0],
+                        egui::Label::new(RichText::new(row.info.tid.to_string()).color(hot_color)),
+                    );
+                    ui.add_sized(
+                        [thread_width, 18.0],
+                        egui::Label::new(RichText::new(row.info.thread_name.clone()).color(hot_color)),
+                    );
+                });
             });
-                }
-            });
+            ui.separator();
+        }
     });
 
     clicked_sort
@@ -1270,14 +1285,15 @@ impl NetmonApp {
 }
 
 // Computes a 2-second average from the newest two history samples.
-fn two_second_avg(history: [u64; CHART_HISTORY_SECONDS]) -> u64 {
-    (history[0] + history[1]) / 2
+fn two_second_avg(history: &[u64]) -> u64 {
+    history[..SHORT_RATE_WINDOW_SECONDS]
+        .iter()
+        .copied()
+        .sum::<u64>()
+        / SHORT_RATE_WINDOW_SECONDS as u64
 }
 
 // Computes a 10-second average from the newest ten history samples.
-fn ten_second_avg(history: [u64; CHART_HISTORY_SECONDS]) -> u64 {
-    history[0..10].iter().copied().sum::<u64>() / 10
-}
 
 // Converts bytes/s to KB/s for chart display.
 fn bytes_to_kib_per_sec(bytes_per_sec: u64) -> f64 {
