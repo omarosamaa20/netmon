@@ -227,33 +227,44 @@ fn run_capture_loop(
     status_tx: Sender<String>,
     mut savefile: Option<Savefile>,
 ) {
+    let mut packets_since_flush: u32 = 0;
+
     while running.load(Ordering::Relaxed) {
         if handle_pending_commands(capture, &command_receiver, &status_tx) {
-            return;
+            break;
         }
 
         match capture.next_packet() {
             Ok(packet) => {
                 if let Some(savefile) = savefile.as_mut() {
                     savefile.write(&packet);
+                    packets_since_flush += 1;
+                    if packets_since_flush >= 100 {
+                        let _ = savefile.flush();
+                        packets_since_flush = 0;
+                    }
                 }
                 if let Some(record) = parse_packet(packet.data, packet.header.len, local_ips) {
                     if flow_sender.send(record).is_err() {
-                        return;
+                        break;
                     }
                 }
             }
             Err(pcap::Error::TimeoutExpired) => {}
             Err(e) => {
-                // G-10: fail closed on interface errors and notify GUI instead of spinning.
                 error!("capture read error: {e}");
                 running.store(false, Ordering::Relaxed);
                 let _ = status_tx.send(
-                    "Capture stopped: interface went down. Select an interface and click Start.".to_string(),
+                    "Capture stopped: interface went down. Select an interface and click Start."
+                        .to_string(),
                 );
-                return;
+                break;
             }
         }
+    }
+
+    if let Some(savefile) = savefile.as_mut() {
+        let _ = savefile.flush();
     }
 }
 

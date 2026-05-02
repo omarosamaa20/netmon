@@ -252,7 +252,7 @@ impl NetmonApp {
 
         self.capture_running = Arc::new(AtomicBool::new(true));
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let home = get_user_home();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -458,7 +458,7 @@ impl NetmonApp {
             return;
         }
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let home = get_user_home();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -534,7 +534,7 @@ impl NetmonApp {
             return;
         }
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let home = get_user_home();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -575,15 +575,16 @@ impl NetmonApp {
     }
 
     // Renders process table, chart, and connection table in the main area.
-    fn render_main_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let sorted_rows = self.sorted_rows(self.process_rows());
-            self.render_process_and_chart_columns(ui, &sorted_rows);
-            ui.separator();
-            ui.heading("Connections");
-            self.render_connection_table(ui, &sorted_rows);
-        });
-    }
+	fn render_main_panel(&mut self, ctx: &egui::Context) {
+	    egui::CentralPanel::default().show(ctx, |ui| {
+		let sorted_rows = self.sorted_rows(self.process_rows());
+		self.render_process_and_chart_columns(ui, &sorted_rows);
+		ui.add_space(8.0);
+		ui.separator();
+		ui.heading("Connections");
+		self.render_connection_table(ui, &sorted_rows);
+	    });
+	}
 
     // Renders the VirtualBox warning banner when virtualized capture is detected.
     fn render_virtualbox_warning(&self, ui: &mut egui::Ui) {
@@ -706,50 +707,55 @@ impl NetmonApp {
     }
 
     // Renders the process table and chart in either split or stacked form.
-    fn render_process_and_chart_columns(&mut self, ui: &mut egui::Ui, sorted_rows: &[ProcessRow]) {
-        let available_width = ui.available_width();
+	fn render_process_and_chart_columns(&mut self, ui: &mut egui::Ui, sorted_rows: &[ProcessRow]) {
+	    let available_width = ui.available_width();
 
-        if available_width < RESPONSIVE_STACK_WIDTH {
-            ui.vertical(|ui| {
-                ui.heading("Processes");
-                if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_thread) {
-                    self.set_sort(column);
-                }
+	    if available_width < RESPONSIVE_STACK_WIDTH {
+		ui.vertical(|ui| {
+		    ui.heading("Processes");
+		    if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_thread) {
+		        self.set_sort(column);
+		    }
 
-                ui.separator();
-                ui.heading(format!("Chart (Last {}s)", self.chart_window_seconds));
-                draw_chart(
-                    ui,
-                    sorted_rows,
-                    self.selected_thread,
-                    self.show_bits,
-                    self.chart_window_seconds,
-                );
-            });
-        } else {
-            ui.columns(2, |columns| {
-                columns[0].vertical(|ui| {
-                    ui.heading("Processes");
-                    if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_thread) {
-                        self.set_sort(column);
-                    }
-                });
+		    ui.separator();
+		    ui.heading(format!("Chart (Last {}s)", self.chart_window_seconds));
+		    draw_chart(
+		        ui,
+		        sorted_rows,
+		        self.selected_thread,
+		        self.show_bits,
+		        self.chart_window_seconds,
+		    );
+		});
+	    } else {
+		ui.columns(2, |columns| {
+		    columns[0].vertical(|ui| {
+		        ui.heading("Processes");
+		        if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_thread) {
+		            self.set_sort(column);
+		        }
+		    });
 
-                columns[1].vertical(|ui| {
-                    ui.heading(format!("Chart (Last {}s)", self.chart_window_seconds));
-                    draw_chart(
-                        ui,
-                        sorted_rows,
-                        self.selected_thread,
-                        self.show_bits,
-                        self.chart_window_seconds,
-                    );
-                });
-            });
-        }
+		    columns[1].vertical(|ui| {
+		        ui.heading(format!("Chart (Last {}s)", self.chart_window_seconds));
+		        egui::ScrollArea::vertical()
+		            .id_source("chart_scroll")
+		            .max_height(CHART_HEIGHT + 32.0)
+		            .show(ui, |ui| {
+		                draw_chart(
+		                    ui,
+		                    sorted_rows,
+		                    self.selected_thread,
+		                    self.show_bits,
+		                    self.chart_window_seconds,
+		                );
+		            });
+		    });
+		});
+	    }
 
-        self.render_selected_row_controls(ui, sorted_rows);
-    }
+	    self.render_selected_row_controls(ui, sorted_rows);
+	}
 
     // Renders quick actions for the currently selected thread row.
     fn render_selected_row_controls(&mut self, ui: &mut egui::Ui, sorted_rows: &[ProcessRow]) {
@@ -1371,6 +1377,21 @@ fn detect_virtualbox() -> bool {
         .to_lowercase();
 
     host.contains("vbox") || product.contains("virtualbox")
+}
+
+// Returns the invoking user's home directory even when running under sudo.
+fn get_user_home() -> String {
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+            for line in passwd.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 6 && fields[0] == sudo_user {
+                    return fields[5].to_string();
+                }
+            }
+        }
+    }
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
 }
 
 // Checks Linux effective capabilities for CAP_NET_ADMIN and CAP_NET_RAW.

@@ -86,21 +86,30 @@ pub fn setup_nftables() -> Result<(), String> {
 
 /// Blocks outgoing traffic for a process by inserting nftables drop rules.
 pub fn block_process(pid: u32, process_name: &str) -> Result<(), String> {
-    // Phase I Lesson TC-1: provide user-triggered process blocking from live telemetry.
     let _ = setup_nftables();
     let _ = unblock_process(pid);
 
     let tcp_ports = collect_pid_ports(pid, &["tcp", "tcp6"])?;
     let udp_ports = collect_pid_ports(pid, &["udp", "udp6"])?;
-
-    if tcp_ports.is_empty() && udp_ports.is_empty() {
-        return Err(format!("No TCP/UDP ports found for PID {pid}"));
-    }
+    let uid = read_uid_for_pid(pid);
 
     let safe_name = process_name.replace('"', "_");
     let comment = format!("{RULE_COMMENT_PREFIX}{pid}-{safe_name}");
 
-    let rules = build_block_ruleset(&tcp_ports, &udp_ports, &comment);
+    let rules = if tcp_ports.is_empty() && udp_ports.is_empty() {
+        if let Some(uid) = uid {
+            format!(
+                "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} \
+                 meta skuid {uid} comment \"{comment}\" drop\n"
+            )
+        } else {
+            return Err(format!(
+                "No TCP/UDP ports and could not read UID for PID {pid}"
+            ));
+        }
+    } else {
+        build_block_ruleset(&tcp_ports, &udp_ports, &comment)
+    };
 
     run_nft_script(&rules)?;
 
@@ -114,10 +123,7 @@ pub fn block_process(pid: u32, process_name: &str) -> Result<(), String> {
         .map_err(|_| "failed to lock rules map".to_string())?;
     guard.insert(
         pid,
-        handles
-            .into_iter()
-            .map(|h| RuleRef { handle: h })
-            .collect(),
+        handles.into_iter().map(|h| RuleRef { handle: h }).collect(),
     );
 
     Ok(())
@@ -187,39 +193,47 @@ pub fn list_rules() -> Result<Vec<String>, String> {
 }
 
 /// Placeholder for future process rate limiting via tc HTB.
-pub fn rate_limit_process(_pid: u32, _rate_kbps: u32) -> Result<(), String> {
-    let pid = _pid;
-    let rate_kbps = _rate_kbps;
-
+pub fn rate_limit_process(pid: u32, rate_kbps: u32) -> Result<(), String> {
     let _ = setup_nftables();
-    let _ = unblock_process(pid);
+
+    remove_rate_limit_rules_for_pid(pid)?;
 
     let tcp_ports = collect_pid_ports(pid, &["tcp", "tcp6"])?;
     let udp_ports = collect_pid_ports(pid, &["udp", "udp6"])?;
-
-    if tcp_ports.is_empty() && udp_ports.is_empty() {
-        return Err(format!("No TCP/UDP ports found for PID {pid}"));
-    }
+    let uid = read_uid_for_pid(pid);
 
     let comment = format!("{RULE_COMMENT_PREFIX}{pid}-rate-limit");
-    let rules = build_rate_limit_ruleset(&tcp_ports, &udp_ports, &comment, rate_kbps);
+
+    let rules = if tcp_ports.is_empty() && udp_ports.is_empty() {
+        if let Some(uid) = uid {
+            format!(
+                "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} \
+                 meta skuid {uid} limit rate over {rate_kbps} kbytes/second \
+                 comment \"{comment}\" drop\n"
+            )
+        } else {
+            return Err(format!(
+                "No TCP/UDP ports and could not read UID for PID {pid}"
+            ));
+        }
+    } else {
+        build_rate_limit_ruleset(&tcp_ports, &udp_ports, &comment, rate_kbps)
+    };
 
     run_nft_script(&rules)?;
 
-    let handles = find_rule_handles_for_pid(pid)?;
+    let handles = find_rule_handles_for_pid_comment(pid, "rate-limit")?;
     if handles.is_empty() {
         return Err("Inserted rate-limit rules but could not find nft handles".to_string());
     }
 
+    let rate_limit_sentinel_pid = pid | 0x8000_0000;
     let mut guard = rules_map()
         .lock()
         .map_err(|_| "failed to lock rules map".to_string())?;
     guard.insert(
-        pid,
-        handles
-            .into_iter()
-            .map(|h| RuleRef { handle: h })
-            .collect(),
+        rate_limit_sentinel_pid,
+        handles.into_iter().map(|h| RuleRef { handle: h }).collect(),
     );
 
     Ok(())
@@ -313,6 +327,17 @@ fn parse_port_from_proc_addr(proc_addr: &str) -> Option<u16> {
     u16::from_str_radix(port_hex, 16).ok()
 }
 
+// Reads the effective UID of a process from /proc/<pid>/status.
+fn read_uid_for_pid(pid: u32) -> Option<u32> {
+    let content = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest.split_whitespace().nth(1)?.parse().ok();
+        }
+    }
+    None
+}
+
 // Joins a sorted set of ports into nft set syntax, e.g. `80, 443`.
 fn join_ports(ports: &BTreeSet<u16>) -> String {
     ports
@@ -393,6 +418,64 @@ fn find_rule_handles_for_pid(pid: u32) -> Result<Vec<u64>, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let marker = format!("{RULE_COMMENT_PREFIX}{pid}-");
+    let mut handles = Vec::new();
+
+    for line in stdout.lines() {
+        if !line.contains(&marker) {
+            continue;
+        }
+        if let Some(idx) = line.rfind("handle ") {
+            let handle_txt = line[(idx + 7)..].trim();
+            if let Ok(handle) = handle_txt.parse::<u64>() {
+                handles.push(handle);
+            }
+        }
+    }
+
+    Ok(handles)
+}
+
+// Removes any existing rate-limit rules for this PID without touching block rules.
+fn remove_rate_limit_rules_for_pid(pid: u32) -> Result<(), String> {
+    let sentinel = pid | 0x8000_0000;
+    let mut handles = Vec::new();
+    {
+        let mut guard = rules_map()
+            .lock()
+            .map_err(|_| "failed to lock rules map".to_string())?;
+        if let Some(refs) = guard.remove(&sentinel) {
+            handles.extend(refs.into_iter().map(|r| r.handle));
+        }
+    }
+    if handles.is_empty() {
+        handles = find_rule_handles_for_pid_comment(pid, "rate-limit")?;
+    }
+    for handle in handles {
+        run_nft_command(
+            [
+                "delete", "rule", NFT_FAMILY, NFT_TABLE_NAME,
+                NFT_OUTPUT_CHAIN, "handle", &handle.to_string(),
+            ],
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+// Like find_rule_handles_for_pid but matches a specific comment suffix.
+fn find_rule_handles_for_pid_comment(pid: u32, suffix: &str) -> Result<Vec<u64>, String> {
+    let output = Command::new("nft")
+        .args(["-a", "list", "chain", NFT_FAMILY, NFT_TABLE_NAME, NFT_OUTPUT_CHAIN])
+        .output()
+        .map_err(|e| format!("failed to run nft list -a: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!("nft list -a failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let marker = format!("{RULE_COMMENT_PREFIX}{pid}-{suffix}");
     let mut handles = Vec::new();
 
     for line in stdout.lines() {

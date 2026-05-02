@@ -234,9 +234,23 @@ pub fn spawn_aggregator_thread(
     }
 }
 
-// Opens the historical CSV file and writes the header row.
+
+fn get_user_home() -> String {
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+            for line in passwd.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 6 && fields[0] == sudo_user {
+                    return fields[5].to_string();
+                }
+            }
+        }
+    }
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+}
+
 fn open_history_csv() -> Option<File> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = get_user_home();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
