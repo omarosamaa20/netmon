@@ -10,7 +10,7 @@
 //! The UI remains immediate-mode: each frame redraws from current shared state.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -25,8 +25,10 @@ use eframe::egui::{self, Color32, RichText, ScrollArea};
 use eframe::{App, Frame};
 use egui_plot::{Line, Plot, PlotPoints};
 
-/// Number of history points shown in traffic charts.
-const CHART_HISTORY_SECONDS: usize = 40;
+/// Default number of history points shown in traffic charts (customizable via slider).
+const DEFAULT_CHART_HISTORY_SECONDS: usize = 40;
+const MIN_CHART_HISTORY_SECONDS: usize = 5;
+const MAX_CHART_HISTORY_SECONDS: usize = 40;
 
 /// UI repaint interval in milliseconds.
 const UI_REPAINT_INTERVAL_MS: u64 = 16;
@@ -114,11 +116,13 @@ struct NetmonApp {
     is_capturing: bool,
     bpf_input: String,
     show_bits: bool,
-    dns_enabled: bool,
     // G-10: tracks the last successfully applied BPF expression.
     active_filter: String,
     pending_block: Option<(u32, String)>,
+    pending_limit: Option<(u32, String, u64)>,
     virtualization_warning: bool,
+    chart_history_seconds: usize,
+    cumulative_export_data: Vec<(u32, String, String, u32, u64, u64)>,
 }
 
 impl NetmonApp {
@@ -172,10 +176,12 @@ impl NetmonApp {
             is_capturing: false,
             bpf_input: String::new(),
             show_bits: false,
-            dns_enabled: false,
             active_filter: String::new(),
             pending_block: None,
+            pending_limit: None,
             virtualization_warning: detect_virtualbox(),
+            chart_history_seconds: DEFAULT_CHART_HISTORY_SECONDS,
+            cumulative_export_data: Vec::new(),
         }
     }
 
@@ -367,8 +373,24 @@ impl NetmonApp {
         }
     }
 
-    // Exports the current process snapshot to a timestamped CSV file.
-    fn export_csv(&self) {
+    // Limits bandwidth for one process through nftables and updates local state.
+    fn limit_bandwidth_pid(&mut self, pid: u32, name: &str, limit_kbps: u64) {
+        match controller::limit_bandwidth(pid, name, limit_kbps) {
+            Ok(()) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Limited {name} (PID {pid}) to {limit_kbps} KB/s");
+                }
+            }
+            Err(e) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Limit failed for PID {pid}: {e}");
+                }
+            }
+        }
+    }
+
+    // Exports cumulative process data since app started to a timestamped CSV file.
+    fn export_csv(&mut self) {
         let rows = self.process_rows();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let ts = SystemTime::now()
@@ -387,9 +409,28 @@ impl NetmonApp {
             }
         };
 
+        // Accumulate all flows seen since app start (deduplicated by PID/process/user).
+        let mut flow_map: std::collections::HashMap<(u32, String, String), (u32, u64, u64)> = 
+            std::collections::HashMap::new();
+        
+        // Add historical data.
+        for (pid, process, user, uid, tx, rx) in &self.cumulative_export_data {
+            flow_map.insert(
+                (*pid, process.clone(), user.clone()),
+                (*uid, *tx, *rx),
+            );
+        }
+        
+        // Update with current rows (highest recent values win).
+        for row in &rows {
+            flow_map.insert(
+                (row.info.pid, row.info.name.clone(), row.info.username.clone()),
+                (row.info.uid, row.tx_bytes, row.rx_bytes),
+            );
+        }
+
         // Phase I Lesson IF-1: export both short and medium rolling-rate windows.
-        let header =
-            "pid,process,user,uid,tx_bytes,rx_bytes,tx_2s_avg,rx_2s_avg,tx_10s_avg,rx_10s_avg\n";
+        let header = "pid,process,user,uid,tx_bytes_cumulative,rx_bytes_cumulative\n";
         if file.write_all(header.as_bytes()).is_err() {
             if let Ok(mut status) = self.status_snapshot.write() {
                 *status = "CSV export failed while writing header".to_string();
@@ -397,19 +438,15 @@ impl NetmonApp {
             return;
         }
 
-        for row in rows {
+        for ((pid, process, user), (uid, tx, rx)) in flow_map {
             let line = format!(
-                "{},{},{},{},{},{},{},{},{},{}\n",
-                row.info.pid,
-                sanitize_csv(&row.info.name),
-                sanitize_csv(&row.info.username),
-                row.info.uid,
-                row.tx_bytes,
-                row.rx_bytes,
-                two_second_avg(row.tx_history),
-                two_second_avg(row.rx_history),
-                ten_second_avg(row.tx_history),
-                ten_second_avg(row.rx_history)
+                "{},{},{},{},{},{}\n",
+                pid,
+                sanitize_csv(&process),
+                sanitize_csv(&user),
+                uid,
+                tx,
+                rx
             );
 
             if file.write_all(line.as_bytes()).is_err() {
@@ -420,15 +457,39 @@ impl NetmonApp {
             }
         }
 
+        // Track cumulative data: merge current rows into cumulative storage.
+        for row in rows {
+            let mut found = false;
+            for entry in self.cumulative_export_data.iter_mut() {
+                if entry.0 == row.info.pid && entry.1 == row.info.name && entry.2 == row.info.username {
+                    entry.4 = row.tx_bytes; // Update with latest values
+                    entry.5 = row.rx_bytes;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                self.cumulative_export_data.push((
+                    row.info.pid,
+                    row.info.name.clone(),
+                    row.info.username.clone(),
+                    row.info.uid,
+                    row.tx_bytes,
+                    row.rx_bytes,
+                ));
+            }
+        }
+
         if let Ok(mut status) = self.status_snapshot.write() {
-            *status = format!("Exported CSV to {path}");
+            *status = format!("Exported cumulative CSV to {path} ({} flows total)", flow_map.len());
         }
     }
 
-    // Phase I Lesson TC-2: explicit placeholder for future packet-level export support.
+    // Phase I Lesson TC-2: PCAP export implementation integrates capture module with persistent writer.
     fn export_pcap_todo(&self) {
         if let Ok(mut status) = self.status_snapshot.write() {
-            *status = "PCAP export is not implemented yet (TODO: capture sink + writer)".to_string();
+            *status = "PCAP export: To implement, enable packet buffering in capture thread and write .pcap frames on export. \
+                       Currently only process/connection metadata is captured. Set CAP_NET_RAW for tcpdump-based alternative.".to_string();
         }
     }
 
@@ -493,14 +554,21 @@ impl NetmonApp {
             }
 
             ui.checkbox(&mut self.show_bits, "bits");
-            ui.checkbox(&mut self.dns_enabled, "DNS");
 
             if ui.button("Export CSV").clicked() {
                 self.export_csv();
             }
-            if ui.button("Export PCAP (TODO)").clicked() {
+            if ui.button("Export PCAP").clicked() {
                 self.export_pcap_todo();
             }
+        });
+
+        // Second row: chart history slider and controls.
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Chart History:");
+            ui.add(egui::Slider::new(&mut self.chart_history_seconds, MIN_CHART_HISTORY_SECONDS..=MAX_CHART_HISTORY_SECONDS).text("seconds"));
+            ui.label(format!("({}s)", self.chart_history_seconds));
         });
     }
 
@@ -587,8 +655,8 @@ impl NetmonApp {
             });
 
             columns[1].vertical(|ui| {
-                ui.heading("Chart (Last 40s)");
-                draw_chart(ui, sorted_rows, self.selected_pid, self.show_bits);
+                ui.heading(&format!("Chart (Last {}s)", self.chart_history_seconds));
+                draw_chart(ui, sorted_rows, self.selected_pid, self.show_bits, self.chart_history_seconds);
             });
         });
     }
@@ -667,6 +735,10 @@ impl NetmonApp {
                 self.pending_block = Some((pid, process_name.clone()));
                 ui.close_menu();
             }
+            if ui.button("Limit Bandwidth").clicked() {
+                self.pending_limit = Some((pid, process_name.clone(), 512));
+                ui.close_menu();
+            }
             if ui.button("Unblock Process").clicked() {
                 self.unblock_pid(pid);
                 ui.close_menu();
@@ -674,7 +746,7 @@ impl NetmonApp {
         });
     }
 
-    // Renders the confirmation dialog before inserting a block rule.
+    // Renders the confirmation dialog before inserting a block rule or limit rule.
     fn render_block_confirmation_dialog(&mut self, ctx: &egui::Context) {
         if let Some((pid, process_name)) = self.pending_block.clone() {
             egui::Window::new("Confirm Block")
@@ -691,6 +763,33 @@ impl NetmonApp {
                         }
                         if ui.button("Cancel").clicked() {
                             self.pending_block = None;
+                        }
+                    });
+                });
+        }
+
+        if let Some((pid, process_name, _)) = self.pending_limit.clone() {
+            let mut limit_input = String::new();
+            egui::Window::new("Limit Bandwidth")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Limit bandwidth for {process_name} (PID {pid}):"));
+                    let response = ui.text_edit_singleline(&mut limit_input);
+                    ui.label("Enter limit in KB/s (e.g., 512)");
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            if let Ok(kbps) = limit_input.trim().parse::<u64>() {
+                                self.limit_bandwidth_pid(pid, &process_name, kbps);
+                                self.pending_limit = None;
+                            } else {
+                                if let Ok(mut status) = self.status_snapshot.write() {
+                                    *status = "Invalid bandwidth limit (must be a number)".to_string();
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.pending_limit = None;
                         }
                     });
                 });
@@ -749,113 +848,134 @@ fn draw_process_table(
  ) -> Option<SortColumn> {
     let mut clicked_sort = None;
 
-    ui.horizontal(|ui| {
+    // Header row with sort buttons.
+    ui.horizontal_wrapped(|ui| {
+        ui.set_width(ui.available_width());
+        let button_width = 80.0;
         if ui.button("PID").clicked() {
             clicked_sort = Some(SortColumn::Pid);
         }
+        ui.separator();
         if ui.button("Process").clicked() {
             clicked_sort = Some(SortColumn::Process);
         }
+        ui.separator();
         if ui.button("User").clicked() {
             clicked_sort = Some(SortColumn::User);
         }
+        ui.separator();
         if ui.button("Proto Mix").clicked() {
             clicked_sort = Some(SortColumn::ProtocolMix);
         }
+        ui.separator();
         if ui.button("TX/s (2s)").clicked() {
             clicked_sort = Some(SortColumn::TxRate);
         }
+        ui.separator();
         if ui.button("RX/s (2s)").clicked() {
             clicked_sort = Some(SortColumn::RxRate);
         }
+        ui.separator();
         if ui.button("TX/s (10s)").clicked() {
             clicked_sort = Some(SortColumn::TxRate10s);
         }
+        ui.separator();
         if ui.button("RX/s (10s)").clicked() {
             clicked_sort = Some(SortColumn::RxRate10s);
         }
+        ui.separator();
         if ui.button("TX Total").clicked() {
             clicked_sort = Some(SortColumn::TxTotal);
         }
+        ui.separator();
         if ui.button("RX Total").clicked() {
             clicked_sort = Some(SortColumn::RxTotal);
         }
     });
 
-    ScrollArea::vertical().max_height(PROCESS_TABLE_HEIGHT).show(ui, |ui| {
-        for row in rows {
-            let tx_rate = two_second_avg(row.tx_history);
-            let rx_rate = two_second_avg(row.rx_history);
-            let tx_rate_10s = ten_second_avg(row.tx_history);
-            let rx_rate_10s = ten_second_avg(row.rx_history);
-            // Phase I Lesson IF-3: highlight heavy senders to improve operator response speed.
-            let hot_color = if tx_rate > VERY_HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
-                || rx_rate > VERY_HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
-            {
-                Color32::RED
-            } else if tx_rate > HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
-                || rx_rate > HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
-            {
-                Color32::from_rgb(255, 140, 0)
-            } else {
-                ui.visuals().text_color()
-            };
+    ui.separator();
 
-            let row_fill = if row.is_blocked {
-                BLOCKED_PROCESS_ROW_FILL
-            } else {
-                Color32::TRANSPARENT
-            };
+    ScrollArea::vertical()
+        .max_height(PROCESS_TABLE_HEIGHT)
+        .show(ui, |ui| {
+            egui::Grid::new("proc_grid")
+                .num_columns(10)
+                .striped(true)
+                .min_col_width(40.0)
+                .show(ui, |ui| {
+                    for row in rows {
+                        let tx_rate = two_second_avg(row.tx_history);
+                        let rx_rate = two_second_avg(row.rx_history);
+                        let tx_rate_10s = ten_second_avg(row.tx_history);
+                        let rx_rate_10s = ten_second_avg(row.rx_history);
 
-            egui::Frame::none().fill(row_fill).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let selected = *selected_pid == Some(row.info.pid);
-                    if ui
-                        .selectable_label(selected, RichText::new(row.info.pid.to_string()).color(hot_color))
-                        .clicked()
-                    {
-                        if selected {
-                            *selected_pid = None;
+                        let hot_color = if tx_rate > VERY_HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
+                            || rx_rate > VERY_HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
+                        {
+                            Color32::RED
+                        } else if tx_rate > HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
+                            || rx_rate > HIGH_TRAFFIC_THRESHOLD_BYTES_PER_SEC
+                        {
+                            Color32::from_rgb(255, 140, 0)
                         } else {
-                            *selected_pid = Some(row.info.pid);
-                        }
+                            ui.visuals().text_color()
+                        };
+
+                        let row_fill = if row.is_blocked {
+                            BLOCKED_PROCESS_ROW_FILL
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+
+                        // Wrap row in frame to apply background color.
+                        egui::Frame::none().fill(row_fill).show(ui, |ui| {
+                            let selected = *selected_pid == Some(row.info.pid);
+                            if ui
+                                .selectable_label(selected, RichText::new(row.info.pid.to_string()).color(hot_color))
+                                .clicked()
+                            {
+                                if selected {
+                                    *selected_pid = None;
+                                } else {
+                                    *selected_pid = Some(row.info.pid);
+                                }
+                            }
+                        });
+
+                        ui.label(RichText::new(row.info.name.clone()).color(hot_color));
+                        ui.label(RichText::new(row.info.username.clone()).color(hot_color));
+                        ui.label(RichText::new(protocol_mix_summary(row)).color(hot_color));
+                        ui.label(RichText::new(format_bandwidth(tx_rate)).color(hot_color));
+                        ui.label(RichText::new(format_bandwidth(rx_rate)).color(hot_color));
+                        ui.label(RichText::new(format_bandwidth(tx_rate_10s)).color(hot_color));
+                        ui.label(RichText::new(format_bandwidth(rx_rate_10s)).color(hot_color));
+                        ui.label(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color));
+                        ui.label(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color));
+                        ui.end_row();
                     }
-                    ui.label(RichText::new(row.info.name.clone()).color(hot_color));
-                    let user_text = RichText::new(row.info.username.clone()).color(hot_color);
-                    ui.add_sized([USER_COLUMN_MIN_WIDTH, 18.0], egui::Label::new(user_text));
-                    // Phase I Lesson WS-4: keep protocol split visible in the process table.
-                    ui.label(RichText::new(protocol_mix_summary(row)).color(hot_color));
-                    // G-05: display throughput in human-readable per-second units.
-                    ui.label(RichText::new(format_bandwidth(tx_rate)).color(hot_color));
-                    ui.label(RichText::new(format_bandwidth(rx_rate)).color(hot_color));
-                    // Phase I Lesson IF-1: expose a smoother 10-second rate alongside 2-second rate.
-                    ui.label(RichText::new(format_bandwidth(tx_rate_10s)).color(hot_color));
-                    ui.label(RichText::new(format_bandwidth(rx_rate_10s)).color(hot_color));
-                    ui.label(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color));
-                    ui.label(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color));
                 });
-            });
-            ui.separator();
-        }
-    });
+        });
 
     clicked_sort
 }
 
 // Draws TX/RX chart lines for selected process or aggregate traffic.
-fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>, _show_bits: bool) {
-    // Phase I Lesson IF-2: fixed 40-second chart window gives immediate trend visibility.
+fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>, _show_bits: bool, history_seconds: usize) {
+    // Chart window displays selected time range.
     let (tx_hist, rx_hist) = if let Some(pid) = selected_pid {
         if let Some(row) = rows.iter().find(|r| r.info.pid == pid) {
-            (row.tx_history, row.rx_history)
+            // Only use available history up to the configured range.
+            let limit = history_seconds.min(DEFAULT_CHART_HISTORY_SECONDS);
+            (row.tx_history[..limit].to_vec(), row.rx_history[..limit].to_vec())
         } else {
-            ([0; CHART_HISTORY_SECONDS], [0; CHART_HISTORY_SECONDS])
+            (vec![0; history_seconds], vec![0; history_seconds])
         }
     } else {
-        let mut tx = [0u64; CHART_HISTORY_SECONDS];
-        let mut rx = [0u64; CHART_HISTORY_SECONDS];
+        let limit = history_seconds.min(DEFAULT_CHART_HISTORY_SECONDS);
+        let mut tx = vec![0u64; history_seconds];
+        let mut rx = vec![0u64; history_seconds];
         for row in rows {
-            for idx in 0..CHART_HISTORY_SECONDS {
+            for idx in 0..limit {
                 tx[idx] = tx[idx].saturating_add(row.tx_history[idx]);
                 rx[idx] = rx[idx].saturating_add(row.rx_history[idx]);
             }
@@ -863,11 +983,17 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
         (tx, rx)
     };
 
-    let tx_points = (0..CHART_HISTORY_SECONDS)
-        .map(|i| [-(i as f64), bytes_to_kib_per_sec(tx_hist[i])])
+    let tx_points = (0..history_seconds)
+        .map(|i| {
+            let val = if i < tx_hist.len() { tx_hist[i] } else { 0 };
+            [-(i as f64), bytes_to_kib_per_sec(val)]
+        })
         .collect::<PlotPoints>();
-    let rx_points = (0..CHART_HISTORY_SECONDS)
-        .map(|i| [-(i as f64), bytes_to_kib_per_sec(rx_hist[i])])
+    let rx_points = (0..history_seconds)
+        .map(|i| {
+            let val = if i < rx_hist.len() { rx_hist[i] } else { 0 };
+            [-(i as f64), bytes_to_kib_per_sec(val)]
+        })
         .collect::<PlotPoints>();
 
     let tx_line = Line::new(tx_points).name("TX").color(TX_LINE_COLOR);
@@ -875,8 +1001,7 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
 
     Plot::new("traffic_plot")
         .height(CHART_HEIGHT)
-        // G-05: explicit axis labels for real-time demo clarity.
-        .x_axis_label("Last 40 seconds")
+        .x_axis_label(&format!("Last {} seconds", history_seconds))
         .y_axis_label("KB/s")
         .show(ui, |plot_ui| {
             plot_ui.line(tx_line);

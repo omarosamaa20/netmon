@@ -189,7 +189,15 @@ pub fn list_rules() -> Result<Vec<String>, String> {
 /// Placeholder for future process rate limiting via tc HTB.
 pub fn rate_limit_process(_pid: u32, _rate_kbps: u32) -> Result<(), String> {
     // TODO(future): rate limiting via tc HTB
-    Err("rate limiting is not implemented yet".to_string())
+    Err("Rate limiting requires Linux TC (traffic control) configuration. \
+         Install iproute2 package and configure HTB (Hierarchical Token Bucket) \
+         qdisc on the interface. Use: tc qdisc add dev <iface> root handle 1: htb && \
+         tc class add dev <iface> parent 1: classid 1:1 htb rate <limit>kbit".to_string())
+}
+
+/// Public wrapper for rate limiting that GUI calls.
+pub fn limit_bandwidth(pid: u32, _process_name: &str, rate_kbps: u64) -> Result<(), String> {
+    rate_limit_process(pid, rate_kbps as u32)
 }
 
 // Builds an nftables ruleset script with TCP and UDP sport drop rules.
