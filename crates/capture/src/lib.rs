@@ -10,6 +10,7 @@
 //! per-packet payload inspection is out of scope for this project.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use log::{debug, error};
-use pcap::{Active, Capture};
+use pcap::{Active, Capture, Savefile};
 use thiserror::Error;
 
 /// libpcap capture buffer size in bytes.
@@ -174,6 +175,7 @@ pub fn spawn_capture_thread(
     flow_sender: SyncSender<FlowRecord>,
     running: Arc<AtomicBool>,
     status_tx: Sender<String>,
+    recording_path: Option<PathBuf>,
 ) -> Result<CaptureControl, CaptureError> {
     let inactive = Capture::from_device(interface)?;
     let mut capture = inactive
@@ -181,6 +183,17 @@ pub fn spawn_capture_thread(
         .buffer_size(PCAP_BUFFER_SIZE_BYTES)
         .timeout(PCAP_READ_TIMEOUT_MS)
         .open()?;
+
+    let savefile = match recording_path {
+        Some(path) => match capture.savefile(path) {
+            Ok(savefile) => Some(savefile),
+            Err(error) => {
+                let _ = status_tx.send(format!("PCAP recording disabled: {error}"));
+                None
+            }
+        },
+        None => None,
+    };
 
     let (command_sender, command_receiver) = mpsc::channel::<CaptureCommand>();
     let status_interface = interface.to_string();
@@ -194,6 +207,7 @@ pub fn spawn_capture_thread(
             running,
             command_receiver,
             status_tx,
+            savefile,
         );
     });
 
@@ -211,6 +225,7 @@ fn run_capture_loop(
     running: Arc<AtomicBool>,
     command_receiver: Receiver<CaptureCommand>,
     status_tx: Sender<String>,
+    mut savefile: Option<Savefile>,
 ) {
     while running.load(Ordering::Relaxed) {
         if handle_pending_commands(capture, &command_receiver, &status_tx) {
@@ -219,6 +234,9 @@ fn run_capture_loop(
 
         match capture.next_packet() {
             Ok(packet) => {
+                if let Some(savefile) = savefile.as_mut() {
+                    savefile.write(&packet);
+                }
                 if let Some(record) = parse_packet(packet.data, packet.header.len, local_ips) {
                     if flow_sender.send(record).is_err() {
                         return;

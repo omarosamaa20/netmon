@@ -42,6 +42,24 @@ const PROCESS_EVICTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Placeholder label when resolver cannot map a flow.
 const UNKNOWN_PROCESS_LABEL: &str = "[unknown]";
 
+/// One per-thread CSV row captured for session export.
+#[derive(Debug, Clone)]
+pub struct HistoryCsvRow {
+    pub timestamp: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub process: String,
+    pub thread: String,
+    pub user: String,
+    pub uid: u32,
+    pub tx_bytes_total: u64,
+    pub rx_bytes_total: u64,
+    pub tx_2s_avg: u64,
+    pub rx_2s_avg: u64,
+    pub tx_10s_avg: u64,
+    pub rx_10s_avg: u64,
+}
+
 /// Key used to track per-thread statistics: (pid, tid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadKey {
@@ -181,6 +199,7 @@ pub fn spawn_aggregator_thread(
     interface_snapshot: Arc<RwLock<InterfaceStats>>,
     status_snapshot: Arc<RwLock<String>>,
     blocked_pids: Arc<RwLock<HashSet<u32>>>,
+    session_history_snapshot: Arc<RwLock<Vec<HistoryCsvRow>>>,
 ) -> AggregatorControl {
     let join_handle = thread::spawn(move || {
         run_aggregator_loop(
@@ -190,6 +209,7 @@ pub fn spawn_aggregator_thread(
             interface_snapshot,
             status_snapshot,
             blocked_pids,
+            session_history_snapshot,
         );
     });
 
@@ -223,17 +243,39 @@ fn open_history_csv() -> Option<File> {
 }
 
 // Appends one row per active thread to the history CSV on each second tick.
-fn append_history_csv(file: &mut File, stats_map: &HashMap<ThreadKey, ThreadStats>) {
+fn append_history_csv(
+    file: &mut File,
+    stats_map: &HashMap<ThreadKey, ThreadStats>,
+    session_history_snapshot: &Arc<RwLock<Vec<HistoryCsvRow>>>,
+) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+
+    let mut exported_rows = Vec::with_capacity(stats_map.len());
 
     for stats in stats_map.values() {
         let tx_2s = two_second_avg(stats.tx_history);
         let rx_2s = two_second_avg(stats.rx_history);
         let tx_10s = ten_second_avg(stats.tx_history);
         let rx_10s = ten_second_avg(stats.rx_history);
+
+        exported_rows.push(HistoryCsvRow {
+            timestamp: ts,
+            pid: stats.info.pid,
+            tid: stats.info.tid,
+            process: stats.info.name.clone(),
+            thread: stats.info.thread_name.clone(),
+            user: stats.info.username.clone(),
+            uid: stats.info.uid,
+            tx_bytes_total: stats.tx_bytes_total,
+            rx_bytes_total: stats.rx_bytes_total,
+            tx_2s_avg: tx_2s,
+            rx_2s_avg: rx_2s,
+            tx_10s_avg: tx_10s,
+            rx_10s_avg: rx_10s,
+        });
 
         let line = format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
@@ -253,6 +295,10 @@ fn append_history_csv(file: &mut File, stats_map: &HashMap<ThreadKey, ThreadStat
         );
 
         let _ = file.write_all(line.as_bytes());
+    }
+
+    if let Ok(mut history) = session_history_snapshot.write() {
+        history.extend(exported_rows);
     }
 }
 
@@ -276,6 +322,7 @@ fn run_aggregator_loop(
     interface_snapshot: Arc<RwLock<InterfaceStats>>,
     status_snapshot: Arc<RwLock<String>>,
     blocked_pids: Arc<RwLock<HashSet<u32>>>,
+    session_history_snapshot: Arc<RwLock<Vec<HistoryCsvRow>>>,
 ) {
     let mut resolver = match Resolver::new() {
         Ok(resolver) => resolver,
@@ -333,7 +380,7 @@ fn run_aggregator_loop(
         // Append one CSV snapshot per second tick.
         if rotated {
             if let Some(ref mut csv_file) = history_csv {
-                append_history_csv(csv_file, &stats_by_thread);
+                append_history_csv(csv_file, &stats_by_thread, &session_history_snapshot);
             }
         }
 

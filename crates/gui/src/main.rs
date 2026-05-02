@@ -13,12 +13,13 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aggregator::{spawn_aggregator_thread, AggregatorControl, InterfaceStats, ProcessRow};
+use aggregator::{spawn_aggregator_thread, AggregatorControl, HistoryCsvRow, InterfaceStats, ProcessRow, ThreadKey};
 use anyhow::Result;
 use capture::{spawn_capture_thread, CaptureControl};
 use eframe::egui::{self, Color32, RichText, ScrollArea};
@@ -27,6 +28,9 @@ use egui_plot::{Line, Plot, PlotPoints};
 
 /// Number of history points shown in traffic charts.
 const CHART_HISTORY_SECONDS: usize = 40;
+
+/// Default number of seconds shown by the live chart.
+const DEFAULT_CHART_WINDOW_SECONDS: usize = 40;
 
 /// UI repaint interval in milliseconds.
 const UI_REPAINT_INTERVAL_MS: u64 = 16;
@@ -70,6 +74,48 @@ const BITS_PER_BYTE: f64 = 8.0;
 /// Binary scale used in byte/bit unit formatting.
 const KIBI_BASE: f64 = 1024.0;
 
+/// Process table PID column width.
+const PROCESS_PID_WIDTH: f32 = 60.0;
+
+/// Process table TID column width.
+const PROCESS_TID_WIDTH: f32 = 60.0;
+
+/// Process table process-name column width.
+const PROCESS_NAME_WIDTH: f32 = 180.0;
+
+/// Process table thread-name column width.
+const PROCESS_THREAD_WIDTH: f32 = 180.0;
+
+/// Process table bandwidth column width.
+const PROCESS_BW_WIDTH: f32 = 88.0;
+
+/// Process table total-byte column width.
+const PROCESS_TOTAL_WIDTH: f32 = 96.0;
+
+/// Connection table PID/TID width.
+const CONNECTION_PID_WIDTH: f32 = 60.0;
+
+/// Connection table thread-name width.
+const CONNECTION_THREAD_WIDTH: f32 = 160.0;
+
+/// Connection table process-name width.
+const CONNECTION_PROCESS_WIDTH: f32 = 180.0;
+
+/// Connection table address width.
+const CONNECTION_ADDR_WIDTH: f32 = 160.0;
+
+/// Connection table protocol/state width.
+const CONNECTION_PROTO_WIDTH: f32 = 72.0;
+
+/// Connection table traffic total width.
+const CONNECTION_TOTAL_WIDTH: f32 = 96.0;
+
+/// Path prefix used for session PCAP recordings.
+const PCAP_SESSION_PREFIX: &str = "netmon_capture_";
+
+/// Path prefix used for exported PCAP files.
+const PCAP_EXPORT_PREFIX: &str = "netmon_export_";
+
 #[derive(Clone)]
 struct DeviceInfo {
     name: String,
@@ -109,16 +155,19 @@ struct NetmonApp {
     status_tx: Sender<String>,
     status_rx: Receiver<String>,
 
-    selected_pid: Option<u32>,
+    selected_thread: Option<ThreadKey>,
     sort_column: SortColumn,
     sort_ascending: bool,
 
     is_capturing: bool,
     bpf_input: String,
     show_bits: bool,
-    dns_enabled: bool,
     // G-10: tracks the last successfully applied BPF expression.
     active_filter: String,
+    chart_window_seconds: usize,
+    rate_limit_kbps_input: String,
+    session_history_snapshot: Arc<RwLock<Vec<HistoryCsvRow>>>,
+    capture_recording_path: Option<PathBuf>,
     pending_block: Option<(u32, String)>,
     virtualization_warning: bool,
 }
@@ -138,6 +187,7 @@ impl NetmonApp {
         let interface_snapshot = Arc::new(RwLock::new(InterfaceStats::default()));
         let status_snapshot = Arc::new(RwLock::new("Ready".to_string()));
         let blocked_pids = Arc::new(RwLock::new(HashSet::new()));
+        let session_history_snapshot = Arc::new(RwLock::new(Vec::new()));
 
         // Phase I Lesson WS-2: bounded channel provides backpressure between capture and UI pipeline.
         let (tx_flow, rx_flow) = mpsc::sync_channel::<capture::FlowRecord>(1024);
@@ -150,6 +200,7 @@ impl NetmonApp {
             interface_snapshot.clone(),
             status_snapshot.clone(),
             blocked_pids.clone(),
+            session_history_snapshot.clone(),
         ));
 
         let (status_tx, status_rx) = mpsc::channel::<String>();
@@ -168,14 +219,17 @@ impl NetmonApp {
             blocked_pids,
             status_tx,
             status_rx,
-            selected_pid: None,
+            selected_thread: None,
             sort_column: SortColumn::Pid,
             sort_ascending: true,
             is_capturing: false,
             bpf_input: String::new(),
             show_bits: false,
-            dns_enabled: false,
             active_filter: String::new(),
+            chart_window_seconds: DEFAULT_CHART_WINDOW_SECONDS,
+            rate_limit_kbps_input: "1024".to_string(),
+            session_history_snapshot,
+            capture_recording_path: None,
             pending_block: None,
             virtualization_warning: detect_virtualbox(),
         }
@@ -194,21 +248,31 @@ impl NetmonApp {
 
         self.capture_running = Arc::new(AtomicBool::new(true));
 
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let recording_path = PathBuf::from(format!("{home}/{PCAP_SESSION_PREFIX}{ts}.pcap"));
+
         match spawn_capture_thread(
             &iface,
             Vec::new(),
             self.tx_flow.clone(),
             self.capture_running.clone(),
             self.status_tx.clone(),
+            Some(recording_path.clone()),
         ) {
             Ok(control) => {
                 self.capture_control = Some(control);
+                self.capture_recording_path = Some(recording_path);
                 self.is_capturing = true;
                 if let Ok(mut status) = self.status_snapshot.write() {
                     *status = format!("Capturing on {iface}...");
                 }
             }
             Err(e) => {
+                self.capture_recording_path = None;
                 if let Ok(mut status) = self.status_snapshot.write() {
                     *status = format!("Failed to start capture on {iface}: {e}");
                 }
@@ -251,6 +315,12 @@ impl NetmonApp {
     fn apply_bpf_filter(&mut self) {
         if let Some(control) = self.capture_control.as_ref() {
             let expr = self.bpf_input.trim().to_string();
+            if expr.is_empty() {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = "Enter a BPF expression before applying it".to_string();
+                }
+                return;
+            }
             if let Err(e) = control.apply_filter(expr.clone()) {
                 if let Ok(mut status) = self.status_snapshot.write() {
                     *status = format!("BPF error: {e}");
@@ -373,13 +443,25 @@ impl NetmonApp {
 
     // Exports the current process snapshot to a timestamped CSV file.
     fn export_csv(&self) {
-        let rows = self.process_rows();
+        let rows = self
+            .session_history_snapshot
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_default();
+
+        if rows.is_empty() {
+            if let Ok(mut status) = self.status_snapshot.write() {
+                *status = "No session history captured yet".to_string();
+            }
+            return;
+        }
+
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let path = format!("{home}/netmon_export_{ts}.csv");
+        let path = format!("{home}/{PCAP_EXPORT_PREFIX}{ts}.csv");
 
         let mut file = match fs::File::create(&path) {
             Ok(f) => f,
@@ -391,9 +473,8 @@ impl NetmonApp {
             }
         };
 
-        // Phase I Lesson IF-1: export both short and medium rolling-rate windows.
         let header =
-            "pid,tid,process,thread,user,uid,tx_bytes,rx_bytes,tx_2s_avg,rx_2s_avg,tx_10s_avg,rx_10s_avg\n";
+            "timestamp,pid,tid,process,thread,user,uid,tx_bytes_total,rx_bytes_total,tx_2s_avg,rx_2s_avg,tx_10s_avg,rx_10s_avg\n";
         if file.write_all(header.as_bytes()).is_err() {
             if let Ok(mut status) = self.status_snapshot.write() {
                 *status = "CSV export failed while writing header".to_string();
@@ -401,21 +482,25 @@ impl NetmonApp {
             return;
         }
 
+        let mut rows = rows;
+        rows.sort_by_key(|row| (row.timestamp, row.pid, row.tid));
+
         for row in rows {
             let line = format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                row.info.pid,
-                row.info.tid,
-                sanitize_csv(&row.info.name),
-                sanitize_csv(&row.info.thread_name),
-                sanitize_csv(&row.info.username),
-                row.info.uid,
-                row.tx_bytes,
-                row.rx_bytes,
-                two_second_avg(row.tx_history),
-                two_second_avg(row.rx_history),
-                ten_second_avg(row.tx_history),
-                ten_second_avg(row.rx_history)
+                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                row.timestamp,
+                row.pid,
+                row.tid,
+                sanitize_csv(&row.process),
+                sanitize_csv(&row.thread),
+                sanitize_csv(&row.user),
+                row.uid,
+                row.tx_bytes_total,
+                row.rx_bytes_total,
+                row.tx_2s_avg,
+                row.rx_2s_avg,
+                row.tx_10s_avg,
+                row.rx_10s_avg
             );
 
             if file.write_all(line.as_bytes()).is_err() {
@@ -431,10 +516,38 @@ impl NetmonApp {
         }
     }
 
-    // Phase I Lesson TC-2: explicit placeholder for future packet-level export support.
-    fn export_pcap_todo(&self) {
+    // Exports the current capture session to a timestamped PCAP file.
+    fn export_pcap(&self) {
+        let Some(source_path) = self.capture_recording_path.as_ref() else {
+            if let Ok(mut status) = self.status_snapshot.write() {
+                *status = "PCAP export unavailable: start capture first".to_string();
+            }
+            return;
+        };
+
+        if !source_path.exists() {
+            if let Ok(mut status) = self.status_snapshot.write() {
+                *status = "PCAP export unavailable: no recording file yet".to_string();
+            }
+            return;
+        }
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let destination_path = format!("{home}/{PCAP_EXPORT_PREFIX}{ts}.pcap");
+
+        if let Err(error) = fs::copy(source_path, &destination_path) {
+            if let Ok(mut status) = self.status_snapshot.write() {
+                *status = format!("PCAP export failed: {error}");
+            }
+            return;
+        }
+
         if let Ok(mut status) = self.status_snapshot.write() {
-            *status = "PCAP export is not implemented yet (TODO: capture sink + writer)".to_string();
+            *status = format!("Exported PCAP to {destination_path}");
         }
     }
 
@@ -497,15 +610,23 @@ impl NetmonApp {
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.apply_bpf_filter();
             }
+            if ui.button("Apply BPF").clicked() {
+                self.apply_bpf_filter();
+            }
 
             ui.checkbox(&mut self.show_bits, "bits");
-            ui.checkbox(&mut self.dns_enabled, "DNS");
+            ui.label("Chart window:");
+            ui.add(egui::Slider::new(
+                &mut self.chart_window_seconds,
+                1..=CHART_HISTORY_SECONDS,
+            )
+            .suffix("s"));
 
             if ui.button("Export CSV").clicked() {
                 self.export_csv();
             }
-            if ui.button("Export PCAP (TODO)").clicked() {
-                self.export_pcap_todo();
+            if ui.button("Export PCAP").clicked() {
+                self.export_pcap();
             }
         });
     }
@@ -586,16 +707,64 @@ impl NetmonApp {
         ui.columns(2, |columns| {
             columns[0].vertical(|ui| {
                 ui.heading("Processes");
-                if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_pid)
-                {
+                if let Some(column) = draw_process_table(ui, sorted_rows, self.show_bits, &mut self.selected_thread) {
                     self.set_sort(column);
                 }
             });
 
             columns[1].vertical(|ui| {
-                ui.heading("Chart (Last 40s)");
-                draw_chart(ui, sorted_rows, self.selected_pid, self.show_bits);
+                ui.heading(format!("Chart (Last {}s)", self.chart_window_seconds));
+                draw_chart(
+                    ui,
+                    sorted_rows,
+                    self.selected_thread,
+                    self.show_bits,
+                    self.chart_window_seconds,
+                );
             });
+        });
+
+        self.render_selected_row_controls(ui, sorted_rows);
+    }
+
+    // Renders quick actions for the currently selected thread row.
+    fn render_selected_row_controls(&mut self, ui: &mut egui::Ui, sorted_rows: &[ProcessRow]) {
+        let Some(selected_thread) = self.selected_thread else {
+            return;
+        };
+
+        let Some(selected_row) = sorted_rows
+            .iter()
+            .find(|row| row.info.pid == selected_thread.pid && row.info.tid == selected_thread.tid) else {
+            return;
+        };
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "Selected thread: {} / {} (PID {}, TID {}, user {})",
+                selected_row.info.name,
+                selected_row.info.thread_name,
+                selected_row.info.pid,
+                selected_row.info.tid,
+                selected_row.info.username
+            ));
+
+            if ui.button("Block Process").clicked() {
+                self.block_pid(selected_row.info.pid, &selected_row.info.name);
+            }
+
+            if ui.button("Block User").clicked() {
+                self.block_user(&selected_row.info.username);
+            }
+
+            ui.label("Limit kbps:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.rate_limit_kbps_input).desired_width(72.0),
+            );
+            if ui.button("Limit Bandwidth").clicked() {
+                self.limit_bandwidth(selected_row.info.pid, &selected_row.info.name);
+            }
         });
     }
 
@@ -603,8 +772,11 @@ impl NetmonApp {
     fn render_connection_table(&mut self, ui: &mut egui::Ui, sorted_rows: &[ProcessRow]) {
         let visible_connections = self.collect_visible_connections(sorted_rows);
 
-        if let Some(selected_pid) = self.selected_pid {
-            if let Some(selected_row) = sorted_rows.iter().find(|row| row.info.pid == selected_pid) {
+        if let Some(selected_thread) = self.selected_thread {
+            if let Some(selected_row) = sorted_rows
+                .iter()
+                .find(|row| row.info.pid == selected_thread.pid && row.info.tid == selected_thread.tid)
+            {
                 // G-06: selected-row header makes process-to-user ownership explicit.
                 ui.label(format!(
                     "Process: {} (PID {}) | User: {}",
@@ -632,7 +804,10 @@ impl NetmonApp {
         let mut visible_connections = Vec::new();
         // TODO(future): async DNS resolution
         for row in sorted_rows {
-            if self.selected_pid.is_none() || self.selected_pid == Some(row.info.pid) {
+            if self
+                .selected_thread
+                .is_none_or(|selected| selected.pid == row.info.pid && selected.tid == row.info.tid)
+            {
                 for connection in &row.connections {
                     visible_connections.push((row.is_blocked, connection.clone()));
                 }
@@ -654,16 +829,51 @@ impl NetmonApp {
             ui.visuals().text_color()
         };
 
-        let pid_response = ui.selectable_label(false, RichText::new(connection.pid.to_string()).color(row_color));
-        ui.label(RichText::new(connection.process.clone()).color(row_color));
+        let pid_response = ui.add_sized(
+            [CONNECTION_PID_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.pid.to_string()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_PID_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.tid.to_string()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_THREAD_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.thread_name.clone()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_PROCESS_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.process.clone()).color(row_color)),
+        );
         // G-02: show username directly on each connection row.
-        ui.label(RichText::new(connection.username.clone()).color(row_color));
-        ui.label(RichText::new(connection.local_addr.to_string()).color(row_color));
-        ui.label(RichText::new(connection.remote_addr.to_string()).color(row_color));
-        ui.label(RichText::new(format_protocol(connection.protocol)).color(row_color));
-        ui.label(RichText::new(connection.state.clone()).color(row_color));
-        ui.label(RichText::new(connection.tx_bytes.to_string()).color(row_color));
-        ui.label(RichText::new(connection.rx_bytes.to_string()).color(row_color));
+        ui.add_sized(
+            [USER_COLUMN_MIN_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.username.clone()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_ADDR_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.local_addr.to_string()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_ADDR_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.remote_addr.to_string()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_PROTO_WIDTH, 18.0],
+            egui::Label::new(RichText::new(format_protocol(connection.protocol)).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_PROTO_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.state.clone()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_TOTAL_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.tx_bytes.to_string()).color(row_color)),
+        );
+        ui.add_sized(
+            [CONNECTION_TOTAL_WIDTH, 18.0],
+            egui::Label::new(RichText::new(connection.rx_bytes.to_string()).color(row_color)),
+        );
         ui.end_row();
 
         let pid = connection.pid;
@@ -671,6 +881,14 @@ impl NetmonApp {
         pid_response.context_menu(|ui| {
             if ui.button("Block Process").clicked() {
                 self.pending_block = Some((pid, process_name.clone()));
+                ui.close_menu();
+            }
+            if ui.button("Block User").clicked() {
+                self.block_user(&connection.username);
+                ui.close_menu();
+            }
+            if ui.button("Limit Bandwidth").clicked() {
+                self.limit_bandwidth(pid, &process_name);
                 ui.close_menu();
             }
             if ui.button("Unblock Process").clicked() {
@@ -711,7 +929,7 @@ impl App for NetmonApp {
 
         // G-07: keyboard shortcut for quickly clearing process selection.
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.selected_pid = None;
+            self.selected_thread = None;
         }
 
         self.render_top_panel(ctx);
@@ -751,52 +969,84 @@ fn draw_process_table(
     ui: &mut egui::Ui,
     rows: &[ProcessRow],
     show_bits: bool,
-    selected_pid: &mut Option<u32>,
+    selected_thread: &mut Option<ThreadKey>,
  ) -> Option<SortColumn> {
     let mut clicked_sort = None;
 
-    ui.horizontal(|ui| {
-        if ui.button("PID").clicked() {
-            clicked_sort = Some(SortColumn::Pid);
-        }
-        if ui.button("TID").clicked() {
-            clicked_sort = Some(SortColumn::Tid);
-        }
-        if ui.button("Thread").clicked() {
-            clicked_sort = Some(SortColumn::Thread);
-        }
-        if ui.button("Process").clicked() {
-            clicked_sort = Some(SortColumn::Process);
-        }
-        if ui.button("User").clicked() {
-            clicked_sort = Some(SortColumn::User);
-        }
-        if ui.button("Proto Mix").clicked() {
-            clicked_sort = Some(SortColumn::ProtocolMix);
-        }
-        if ui.button("TX/s (2s)").clicked() {
-            clicked_sort = Some(SortColumn::TxRate);
-        }
-        if ui.button("RX/s (2s)").clicked() {
-            clicked_sort = Some(SortColumn::RxRate);
-        }
-        if ui.button("TX/s (10s)").clicked() {
-            clicked_sort = Some(SortColumn::TxRate10s);
-        }
-        if ui.button("RX/s (10s)").clicked() {
-            clicked_sort = Some(SortColumn::RxRate10s);
-        }
-        if ui.button("TX Total").clicked() {
-            clicked_sort = Some(SortColumn::TxTotal);
-        }
-        if ui.button("RX Total").clicked() {
-            clicked_sort = Some(SortColumn::RxTotal);
-        }
-
-    });
+    egui::Grid::new("process_header_grid")
+        .striped(true)
+        .show(ui, |ui| {
+            if ui.add_sized([PROCESS_PID_WIDTH, 18.0], egui::Button::new("PID")).clicked() {
+                clicked_sort = Some(SortColumn::Pid);
+            }
+            if ui
+                .add_sized([PROCESS_NAME_WIDTH, 18.0], egui::Button::new("Process"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::Process);
+            }
+            if ui
+                .add_sized([USER_COLUMN_MIN_WIDTH, 18.0], egui::Button::new("User"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::User);
+            }
+            if ui.add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("Proto Mix")).clicked() {
+                clicked_sort = Some(SortColumn::ProtocolMix);
+            }
+            if ui
+                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("TX/s (2s)"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::TxRate);
+            }
+            if ui
+                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("RX/s (2s)"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::RxRate);
+            }
+            if ui
+                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("TX/s (10s)"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::TxRate10s);
+            }
+            if ui
+                .add_sized([PROCESS_BW_WIDTH, 18.0], egui::Button::new("RX/s (10s)"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::RxRate10s);
+            }
+            if ui
+                .add_sized([PROCESS_TOTAL_WIDTH, 18.0], egui::Button::new("TX Total"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::TxTotal);
+            }
+            if ui
+                .add_sized([PROCESS_TOTAL_WIDTH, 18.0], egui::Button::new("RX Total"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::RxTotal);
+            }
+            if ui.add_sized([PROCESS_PID_WIDTH, 18.0], egui::Button::new("TID")).clicked() {
+                clicked_sort = Some(SortColumn::Tid);
+            }
+            if ui
+                .add_sized([PROCESS_THREAD_WIDTH, 18.0], egui::Button::new("Thread"))
+                .clicked()
+            {
+                clicked_sort = Some(SortColumn::Thread);
+            }
+            ui.end_row();
+        });
 
     ScrollArea::vertical().max_height(PROCESS_TABLE_HEIGHT).show(ui, |ui| {
-        for row in rows {
+        egui::Grid::new("process_row_grid")
+            .striped(true)
+            .show(ui, |ui| {
+                for row in rows {
             let tx_rate = two_second_avg(row.tx_history);
             let rx_rate = two_second_avg(row.rx_history);
             let tx_rate_10s = ten_second_avg(row.tx_history);
@@ -821,47 +1071,86 @@ fn draw_process_table(
             };
 
             egui::Frame::none().fill(row_fill).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let selected = *selected_pid == Some(row.info.pid);
-                    if ui
-                        .selectable_label(selected, RichText::new(row.info.pid.to_string()).color(hot_color))
-                        .clicked()
-                    {
-                        if selected {
-                            *selected_pid = None;
-                        } else {
-                            *selected_pid = Some(row.info.pid);
-                        }
+                let selected = *selected_thread == Some(ThreadKey { pid: row.info.pid, tid: row.info.tid });
+                let pid_response = ui.add_sized(
+                    [PROCESS_PID_WIDTH, 18.0],
+                    egui::Button::new(RichText::new(row.info.pid.to_string()).color(hot_color)).selected(selected),
+                );
+                if pid_response.clicked() {
+                    if selected {
+                        *selected_thread = None;
+                    } else {
+                        *selected_thread = Some(ThreadKey { pid: row.info.pid, tid: row.info.tid });
                     }
-                    ui.label(RichText::new(row.info.name.clone()).color(hot_color));
-                    let user_text = RichText::new(row.info.username.clone()).color(hot_color);
-                    ui.add_sized([USER_COLUMN_MIN_WIDTH, 18.0], egui::Label::new(user_text));
-                    // Phase I Lesson WS-4: keep protocol split visible in the process table.
-                    ui.label(RichText::new(protocol_mix_summary(row)).color(hot_color));
-                    // G-05: display throughput in human-readable per-second units.
-                    ui.label(RichText::new(format_bandwidth(tx_rate)).color(hot_color));
-                    ui.label(RichText::new(format_bandwidth(rx_rate)).color(hot_color));
-                    // Phase I Lesson IF-1: expose a smoother 10-second rate alongside 2-second rate.
-                    ui.label(RichText::new(format_bandwidth(tx_rate_10s)).color(hot_color));
-                    ui.label(RichText::new(format_bandwidth(rx_rate_10s)).color(hot_color));
-                    ui.label(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color));
-                    ui.label(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color));
-                    ui.label(RichText::new(row.info.tid.to_string()).color(hot_color));
-                    ui.label(RichText::new(row.info.thread_name.clone()).color(hot_color));
-                });
+                }
+                ui.add_sized(
+                    [PROCESS_NAME_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(row.info.name.clone()).color(hot_color)),
+                );
+                let user_text = RichText::new(row.info.username.clone()).color(hot_color);
+                ui.add_sized([USER_COLUMN_MIN_WIDTH, 18.0], egui::Label::new(user_text));
+                // Phase I Lesson WS-4: keep protocol split visible in the process table.
+                ui.add_sized(
+                    [PROCESS_BW_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(protocol_mix_summary(row)).color(hot_color)),
+                );
+                // G-05: display throughput in human-readable per-second units.
+                ui.add_sized(
+                    [PROCESS_BW_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(format_bandwidth(tx_rate)).color(hot_color)),
+                );
+                ui.add_sized(
+                    [PROCESS_BW_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(format_bandwidth(rx_rate)).color(hot_color)),
+                );
+                // Phase I Lesson IF-1: expose a smoother 10-second rate alongside 2-second rate.
+                ui.add_sized(
+                    [PROCESS_BW_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(format_bandwidth(tx_rate_10s)).color(hot_color)),
+                );
+                ui.add_sized(
+                    [PROCESS_BW_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(format_bandwidth(rx_rate_10s)).color(hot_color)),
+                );
+                ui.add_sized(
+                    [PROCESS_TOTAL_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(format_bytes_or_bits(row.tx_bytes, show_bits)).color(hot_color)),
+                );
+                ui.add_sized(
+                    [PROCESS_TOTAL_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(format_bytes_or_bits(row.rx_bytes, show_bits)).color(hot_color)),
+                );
+                ui.add_sized(
+                    [PROCESS_TID_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(row.info.tid.to_string()).color(hot_color)),
+                );
+                ui.add_sized(
+                    [PROCESS_THREAD_WIDTH, 18.0],
+                    egui::Label::new(RichText::new(row.info.thread_name.clone()).color(hot_color)),
+                );
+                ui.end_row();
             });
-            ui.separator();
-        }
+                }
+            });
     });
 
     clicked_sort
 }
 
 // Draws TX/RX chart lines for selected process or aggregate traffic.
-fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>, _show_bits: bool) {
-    // Phase I Lesson IF-2: fixed 40-second chart window gives immediate trend visibility.
-    let (tx_hist, rx_hist) = if let Some(pid) = selected_pid {
-        if let Some(row) = rows.iter().find(|r| r.info.pid == pid) {
+fn draw_chart(
+    ui: &mut egui::Ui,
+    rows: &[ProcessRow],
+    selected_thread: Option<ThreadKey>,
+    _show_bits: bool,
+    window_seconds: usize,
+) {
+    let window = window_seconds.clamp(1, CHART_HISTORY_SECONDS);
+
+    let (tx_hist, rx_hist) = if let Some(selected_thread) = selected_thread {
+        if let Some(row) = rows.iter().find(|r| {
+            r.info.pid == selected_thread.pid && r.info.tid == selected_thread.tid
+        }) {
             (row.tx_history, row.rx_history)
         } else {
             ([0; CHART_HISTORY_SECONDS], [0; CHART_HISTORY_SECONDS])
@@ -878,10 +1167,10 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
         (tx, rx)
     };
 
-    let tx_points = (0..CHART_HISTORY_SECONDS)
+    let tx_points = (0..window)
         .map(|i| [-(i as f64), bytes_to_kib_per_sec(tx_hist[i])])
         .collect::<PlotPoints>();
-    let rx_points = (0..CHART_HISTORY_SECONDS)
+    let rx_points = (0..window)
         .map(|i| [-(i as f64), bytes_to_kib_per_sec(rx_hist[i])])
         .collect::<PlotPoints>();
 
@@ -891,7 +1180,7 @@ fn draw_chart(ui: &mut egui::Ui, rows: &[ProcessRow], selected_pid: Option<u32>,
     Plot::new("traffic_plot")
         .height(CHART_HEIGHT)
         // G-05: explicit axis labels for real-time demo clarity.
-        .x_axis_label("Last 40 seconds")
+        .x_axis_label(format!("Last {window} seconds"))
         .y_axis_label("KB/s")
         .show(ui, |plot_ui| {
             plot_ui.line(tx_line);
@@ -914,6 +1203,70 @@ fn draw_connection_table_header(ui: &mut egui::Ui) {
     ui.label(RichText::new("TX").strong());
     ui.label(RichText::new("RX").strong());
     ui.end_row();
+}
+
+impl NetmonApp {
+    // Blocks every active PID currently associated with the given username.
+    fn block_user(&mut self, username: &str) {
+        let rows = self.process_rows();
+        let mut blocked_pids = HashSet::new();
+        let mut blocked_labels = Vec::new();
+        let mut errors = Vec::new();
+
+        for row in rows {
+            if row.info.username != username || !blocked_pids.insert(row.info.pid) {
+                continue;
+            }
+
+            match controller::block_process(row.info.pid, &row.info.name) {
+                Ok(()) => {
+                    blocked_labels.push(format!("{} (PID {})", row.info.name, row.info.pid));
+                    if let Ok(mut blocked) = self.blocked_pids.write() {
+                        blocked.insert(row.info.pid);
+                    }
+                }
+                Err(error) => errors.push(format!("PID {}: {error}", row.info.pid)),
+            }
+        }
+
+        if let Ok(mut status) = self.status_snapshot.write() {
+            if !blocked_labels.is_empty() && errors.is_empty() {
+                *status = format!("Blocked user {username}: {}", blocked_labels.join(", "));
+            } else if !blocked_labels.is_empty() {
+                *status = format!("Blocked user {username} with errors: {}", errors.join("; "));
+            } else if errors.is_empty() {
+                *status = format!("No active processes found for user {username}");
+            } else {
+                *status = format!("Failed to block user {username}: {}", errors.join("; "));
+            }
+        }
+    }
+
+    // Limits a selected PID using the controller's rate-limit hook.
+    fn limit_bandwidth(&mut self, pid: u32, name: &str) {
+        let rate_kbps = match self.rate_limit_kbps_input.trim().parse::<u32>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = "Enter a positive kbit/s value before limiting bandwidth".to_string();
+                }
+                return;
+            }
+        };
+
+        match controller::rate_limit_process(pid, rate_kbps) {
+            Ok(()) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Rate-limited {name} (PID {pid}) to {rate_kbps} kbit/s");
+                }
+            }
+            Err(error) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Rate limit failed for PID {pid}: {error}");
+                }
+            }
+        }
+    }
 }
 
 // Computes a 2-second average from the newest two history samples.

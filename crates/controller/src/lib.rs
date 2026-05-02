@@ -188,8 +188,41 @@ pub fn list_rules() -> Result<Vec<String>, String> {
 
 /// Placeholder for future process rate limiting via tc HTB.
 pub fn rate_limit_process(_pid: u32, _rate_kbps: u32) -> Result<(), String> {
-    // TODO(future): rate limiting via tc HTB
-    Err("rate limiting is not implemented yet".to_string())
+    let pid = _pid;
+    let rate_kbps = _rate_kbps;
+
+    let _ = setup_nftables();
+    let _ = unblock_process(pid);
+
+    let tcp_ports = collect_pid_ports(pid, &["tcp", "tcp6"])?;
+    let udp_ports = collect_pid_ports(pid, &["udp", "udp6"])?;
+
+    if tcp_ports.is_empty() && udp_ports.is_empty() {
+        return Err(format!("No TCP/UDP ports found for PID {pid}"));
+    }
+
+    let comment = format!("{RULE_COMMENT_PREFIX}{pid}-rate-limit");
+    let rules = build_rate_limit_ruleset(&tcp_ports, &udp_ports, &comment, rate_kbps);
+
+    run_nft_script(&rules)?;
+
+    let handles = find_rule_handles_for_pid(pid)?;
+    if handles.is_empty() {
+        return Err("Inserted rate-limit rules but could not find nft handles".to_string());
+    }
+
+    let mut guard = rules_map()
+        .lock()
+        .map_err(|_| "failed to lock rules map".to_string())?;
+    guard.insert(
+        pid,
+        handles
+            .into_iter()
+            .map(|h| RuleRef { handle: h })
+            .collect(),
+    );
+
+    Ok(())
 }
 
 // Builds an nftables ruleset script with TCP and UDP sport drop rules.
@@ -207,6 +240,36 @@ fn build_block_ruleset(tcp_ports: &BTreeSet<u16>, udp_ports: &BTreeSet<u16>, com
         ruleset.push_str(&format!(
             "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} udp sport {{ {} }} comment \"{}\" drop\n",
             join_ports(udp_ports),
+            comment
+        ));
+    }
+
+    ruleset
+}
+
+// Builds an nftables ruleset script that drops packets above the requested rate.
+fn build_rate_limit_ruleset(
+    tcp_ports: &BTreeSet<u16>,
+    udp_ports: &BTreeSet<u16>,
+    comment: &str,
+    rate_kbps: u32,
+) -> String {
+    let mut ruleset = String::new();
+    let rate_expr = format!("{rate_kbps} kbytes/second");
+
+    if !tcp_ports.is_empty() {
+        ruleset.push_str(&format!(
+            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} tcp sport {{ {} }} limit rate over {} comment \"{}\" drop\n",
+            join_ports(tcp_ports),
+            rate_expr,
+            comment
+        ));
+    }
+    if !udp_ports.is_empty() {
+        ruleset.push_str(&format!(
+            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} udp sport {{ {} }} limit rate over {} comment \"{}\" drop\n",
+            join_ports(udp_ports),
+            rate_expr,
             comment
         ));
     }
